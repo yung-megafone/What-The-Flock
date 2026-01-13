@@ -21,9 +21,33 @@
 #include "esp_spiffs.h"
 #include "esp_timer.h"
 
-// Hardware Definitions
-#define USER_LED_GPIO 15 // C6 USER LED
-#define USER_BUZZER_GPIO 0 // C6 Buzzer
+// Hardware Definitions - Conditional on Target Chip
+#if CONFIG_IDF_TARGET_ESP32C6
+    #define USER_LED_GPIO 15
+    #define USER_BUZZER_GPIO 0
+    #define HAS_LED 1
+
+    // External antenna setup for C6
+    #define ENABLE_EXT_ANTENNA 1
+    #define EXT_ANT_PIN1 3
+    #define EXT_ANT_PIN2 14
+
+#elif CONFIG_IDF_TARGET_ESP32S3
+    #define USER_LED_GPIO 21
+    #define USER_BUZZER_GPIO 1
+    #define HAS_LED 1
+    #define ENABLE_EXT_ANTENNA 0
+
+#elif CONFIG_IDF_TARGET_ESP32C3
+    #define USER_BUZZER_GPIO 2
+    #define HAS_LED 0
+    #define ENABLE_EXT_ANTENNA 0
+
+#else
+    #error "Unsupported target chip"
+#endif
+
+// Common definitions
 #define LED_ON  0
 #define LED_OFF 1
 #define BUZZER_ON  1
@@ -187,16 +211,20 @@ static bool extract_source_mac(const uint8_t *frame, uint8_t *src_mac)
 }
 
 static void indicator_task(void *pvParameters) {
+    ESP_LOGI(TAG, "Indicator task running on core %d", xPortGetCoreID());
     while (1) {
-        // Wait indefinitely for a notification
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
+#if HAS_LED
         gpio_set_level(USER_LED_GPIO, LED_ON);
+#endif
         gpio_set_level(USER_BUZZER_GPIO, BUZZER_ON);
 
         vTaskDelay(pdMS_TO_TICKS(80));
 
+#if HAS_LED
         gpio_set_level(USER_LED_GPIO, LED_OFF);
+#endif
         gpio_set_level(USER_BUZZER_GPIO, BUZZER_OFF);
     }
 }
@@ -369,6 +397,7 @@ static void wifi_init_sniffer(void)
 }
 
 static void ble_host_task(void *param) {
+    ESP_LOGI(TAG, "BLE host task running on core %d", xPortGetCoreID());
     nimble_port_run();
     nimble_port_freertos_deinit();
 }
@@ -378,7 +407,6 @@ static void ble_init_monitor(void) {
 
     struct ble_gap_disc_params disc_params = {0};
     disc_params.filter_duplicates = 1;
-
     disc_params.passive = 0;
     disc_params.itvl = 128;
     disc_params.window = 40;
@@ -391,6 +419,7 @@ static void ble_init_monitor(void) {
 
 static void channel_hop_task(void *arg)
 {
+    ESP_LOGI(TAG, "Channel hop task running on core %d", xPortGetCoreID());
     uint8_t channel = 1;
 
     while (1) {
@@ -403,15 +432,16 @@ static void channel_hop_task(void *arg)
 
 void app_main(void)
 {
-    // --- ENABLE EXTERNAL ANTENNA FOR SEEED XIAO C6 ---
-    gpio_reset_pin(3);
-    gpio_reset_pin(14);
-    gpio_set_direction(3, GPIO_MODE_OUTPUT);
-    gpio_set_direction(14, GPIO_MODE_OUTPUT);
-    gpio_set_level(3, 0);
-    vTaskDelay(pdMS_TO_TICKS(10)); 
-    gpio_set_level(14, 1);
-
+    #if ENABLE_EXT_ANTENNA
+        // External antenna for C6
+        gpio_reset_pin(EXT_ANT_PIN1);
+        gpio_reset_pin(EXT_ANT_PIN2);
+        gpio_set_direction(EXT_ANT_PIN1, GPIO_MODE_OUTPUT);
+        gpio_set_direction(EXT_ANT_PIN2, GPIO_MODE_OUTPUT);
+        gpio_set_level(EXT_ANT_PIN1, 0);
+        vTaskDelay(pdMS_TO_TICKS(10));
+        gpio_set_level(EXT_ANT_PIN2, 1);
+    #endif
     // Conservative NVS Initialization (no auto-erase)
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -426,10 +456,11 @@ void app_main(void)
     dump_logs_to_console();
 
     // Initialize GPIOs for indicators
-    gpio_reset_pin(USER_LED_GPIO);
-    gpio_set_direction(USER_LED_GPIO, GPIO_MODE_OUTPUT);
-    gpio_set_level(USER_LED_GPIO, LED_OFF);
-
+    #if HAS_LED
+        gpio_reset_pin(USER_LED_GPIO);
+        gpio_set_direction(USER_LED_GPIO, GPIO_MODE_OUTPUT);
+        gpio_set_level(USER_LED_GPIO, LED_OFF);
+    #endif
     gpio_reset_pin(USER_BUZZER_GPIO);
     gpio_set_direction(USER_BUZZER_GPIO, GPIO_MODE_OUTPUT);
     gpio_set_level(USER_BUZZER_GPIO, BUZZER_OFF);
