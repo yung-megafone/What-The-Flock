@@ -1,4 +1,13 @@
 #include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <inttypes.h>
+#include <sys/stat.h>
+#include "esp_err.h"
+#include "esp_heap_caps.h"
+#include "esp_rom_sys.h"
+#include "wtf_config.h"
+#include "wtf_signal_math.h"
 #include <string.h>
 
 #include "esp_event.h"
@@ -7,6 +16,7 @@
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
 #include "driver/gpio.h"
@@ -22,7 +32,11 @@
 #include "esp_timer.h"
 
 // Hardware Definitions - Conditional on Target Chip
-#if CONFIG_IDF_TARGET_ESP32C6
+#if CONFIG_IDF_TARGET_ESP32C5
+    #define USER_LED_GPIO WTF_LED_GPIO
+    #define HAS_LED 1
+    #define ENABLE_EXT_ANTENNA 0
+#elif CONFIG_IDF_TARGET_ESP32C6
     #define USER_LED_GPIO 15
     #define USER_BUZZER_GPIO 0
     #define HAS_LED 1
@@ -55,8 +69,287 @@
 
 static const char *TAG = "WHAT_THE_FLOCK";
 
-static TaskHandle_t led_task_handle = NULL;
+static bool spiffs_ready = false;
+static volatile bool wifi_ready = false, ble_ready = false;
+static volatile bool wifi_enabled = true, ble_enabled = true;
+static QueueHandle_t log_queue;
+static portMUX_TYPE detection_lock = portMUX_INITIALIZER_UNLOCKED;
+static int last_rssi = -127;     // filtered value for the selected transmitter
+static int64_t last_seen_ms = 0;
+static int tracked_kind = 0;   // 1=Wi-Fi, 2=BLE, 3=synthetic test
+static uint8_t tracked_mac[6];
+static int last_raw_rssi = -127;
+static int peak_rssi = -127;
+static int64_t peak_hold_until_ms = 0;
+static int trend_score = 0;    // -2/-3=receding, +2/+3=approaching
 
+// Centralized fault reporting. The first fatal error is retained for diagnosis.
+typedef enum {
+    WTF_F_NONE = 0,
+    WTF_F_NVS = 1,
+    WTF_F_SPIFFS = 2,
+    WTF_F_WIFI = 3,
+    WTF_F_BLE = 4,
+    WTF_F_LOGGING = 5,
+    WTF_F_SELFTEST = 6,
+    WTF_F_TASK = 7,
+    WTF_F_GPIO = 8,
+    WTF_F_WIFI_HOP = 9,
+    WTF_F_LOG_QUEUE_FULL = 10,
+    WTF_F_TEST_SOS = 11
+} wtf_fault_code_t;
+
+typedef enum { WTF_DEGRADED = 0, WTF_FATAL = 1 } wtf_fault_severity_t;
+static portMUX_TYPE fault_lock = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool fault_latched = false;
+static volatile wtf_fault_code_t fatal_fault_code = WTF_F_NONE;
+static volatile wtf_fault_code_t last_fault_code = WTF_F_NONE;
+static volatile int last_fault_detail = 0;
+static volatile unsigned fault_events = 0;
+static bool sos_preview = false;
+static bool diagnostic_mode = false; // sampled once at boot; never polled afterward
+static volatile uint32_t wifi_rx_packets = 0;
+static volatile uint32_t ble_rx_adverts = 0;
+static uint32_t diagnostic_wifi_rx = 0, diagnostic_ble_rx = 0;
+static int64_t preview_until_ms = 0;
+static int64_t alert_until_ms = 0;
+static int64_t selftest_until_ms = 0;
+static int64_t boot_until_ms = 0;
+static uint8_t recent_macs[24][7]; // [radio kind, 6 MAC bytes]
+static int64_t recent_times[24];
+static unsigned recent_next = 0;
+static unsigned detection_count = 0;
+static int64_t now_ms(void) { return esp_timer_get_time()/1000; }
+
+// Safe for use from FreeRTOS tasks and radio callbacks (not from ISRs).
+// All genuine failures go through this entry point; no USB client is required.
+static void wtf_report_fault(wtf_fault_code_t code, wtf_fault_severity_t severity, int detail) {
+    taskENTER_CRITICAL(&fault_lock);
+    ++fault_events;
+    last_fault_code = code;
+    last_fault_detail = detail;
+    if (severity == WTF_FATAL) {
+        if (!fault_latched) fatal_fault_code = code;
+        fault_latched = true;
+    }
+    taskEXIT_CRITICAL(&fault_lock);
+    ESP_LOGE(TAG, "FAULT F%02u %s detail=%d", (unsigned)code,
+             severity == WTF_FATAL ? "FATAL" : "DEGRADED", detail);
+}
+
+// XIAO ESP32-C5 D10 = GPIO10, a non-strapping GPIO. Jumper D10 to GND
+// before reset to enter diagnostics. The internal pull-up selects normal mode.
+static bool wtf_diagnostic_jumper_present(void) {
+#if CONFIG_IDF_TARGET_ESP32C5 && WTF_ENABLE_BOOT_DIAGNOSTICS
+    gpio_config_t cfg = {
+        .pin_bit_mask = (1ULL << WTF_DIAGNOSTIC_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    esp_err_t err = gpio_config(&cfg);
+    if (err != ESP_OK) {
+        wtf_report_fault(WTF_F_GPIO, WTF_FATAL, err);
+        return false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+    int low_samples = 0;
+    for (int n = 0; n < 5; ++n) {
+        if (gpio_get_level((gpio_num_t)WTF_DIAGNOSTIC_GPIO) == 0) ++low_samples;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    return low_samples >= 4;
+#else
+    return false;
+#endif
+}
+
+// All radio callbacks and diagnostic inputs use this same signal path.
+// Select one transmitter at a time so unrelated radios/MACs cannot fabricate
+// an approach or recession. A new source takes over if the old one went quiet
+// for >1.25s or the newcomer is distinctly stronger (+5 dBm).
+// A single selected source is deliberately simple; this is not a full
+// multi-device tracking database.
+static void wtf_reset_rssi_tracking(void) {
+    taskENTER_CRITICAL(&detection_lock);
+    last_rssi = -127;
+    last_seen_ms = 0;
+    tracked_kind = 0;
+    memset(tracked_mac, 0, sizeof(tracked_mac));
+    last_raw_rssi = -127;
+    peak_rssi = -127;
+    peak_hold_until_ms = 0;
+    trend_score = 0;
+    taskEXIT_CRITICAL(&detection_lock);
+}
+
+static void wtf_update_rssi(int kind, const uint8_t mac[6], int rssi) {
+    const int64_t t = now_ms();
+    if (rssi < -127 || rssi > 20 || mac == NULL) return;
+    taskENTER_CRITICAL(&detection_lock);
+    const bool expired = !last_seen_ms || t - last_seen_ms > WTF_TRACK_TIMEOUT_MS;
+    const bool same = tracked_kind == kind && memcmp(mac, tracked_mac, 6) == 0;
+    if (!same && !expired && t-last_seen_ms < WTF_RSSI_SOURCE_HOLD_MS &&
+        rssi < last_rssi + WTF_RSSI_SOURCE_SWITCH_DB) {
+        taskEXIT_CRITICAL(&detection_lock);
+        return; // weaker unrelated radio does not distort LED/trend
+    }
+    const bool fresh = expired || !same;
+    if (fresh) {
+        tracked_kind = kind;
+        memcpy(tracked_mac, mac, 6);
+        trend_score = 0;
+        peak_rssi = rssi;
+    } else {
+        trend_score = wtf_trend_vote(trend_score, last_raw_rssi, rssi);
+    }
+    last_rssi = wtf_filter_rssi(last_rssi, rssi, fresh);
+    last_raw_rssi = rssi;
+    if (fresh || rssi >= peak_rssi) {
+        peak_rssi = rssi;
+        peak_hold_until_ms = t + WTF_RSSI_PEAK_HOLD_MS;
+    }
+    last_seen_ms = t;
+    taskEXIT_CRITICAL(&detection_lock);
+}
+
+// One animation-speed control. Fixed heartbeat periods are NOT scaled.
+#define ANIM_UNIT_MS (70 + ((WTF_ANIMATION_SPEED - 1) * 130 / 9))
+#if WTF_ANIMATION_SPEED < 1 || WTF_ANIMATION_SPEED > 10
+#error "WTF_ANIMATION_SPEED must be 1..10"
+#endif
+
+static bool unique_transmitter(int kind, const uint8_t mac[6]) {
+    int64_t t = now_ms(); bool fresh = true;
+    taskENTER_CRITICAL(&detection_lock);
+    for (int i=0;i<24;i++) {
+        if (recent_times[i] && recent_macs[i][0] == kind && memcmp(recent_macs[i]+1, mac, 6)==0) {
+            fresh = (t-recent_times[i] > WTF_UNIQUE_COOLDOWN_MS);
+            recent_times[i] = t;
+            break;
+        }
+    }
+    if (fresh) {
+        unsigned idx = recent_next++ % 24;
+        recent_macs[idx][0] = kind;
+        memcpy(recent_macs[idx]+1,mac,6);
+        recent_times[idx]=t;
+        detection_count++;
+        alert_until_ms = t + 5 * ANIM_UNIT_MS;
+    }
+    taskEXIT_CRITICAL(&detection_lock);
+    return fresh;
+}
+static void observe_detection(int kind, const uint8_t mac[6], int rssi, const char *line) {
+    if (diagnostic_mode) return; // test mode never creates real detection records
+    wtf_update_rssi(kind, mac, rssi);
+    if (unique_transmitter(kind,mac)) {
+        ESP_LOGW("DETECTION", "%s",line);
+        if (log_queue) {
+            char record[180]={0}; snprintf(record,sizeof(record),"%s",line);
+            if (xQueueSend(log_queue,record,0)!=pdTRUE) wtf_report_fault(WTF_F_LOG_QUEUE_FULL,WTF_DEGRADED,0);
+        }
+    }
+}
+
+static bool pattern_on(int64_t elapsed, const int *dur, int n) {
+    for(int i=0;i<n;i++) { if(elapsed < dur[i]) return (i%2)==0; elapsed-=dur[i]; }
+    return false;
+}
+static void indicator_task(void *arg) {
+    // Sole owner of indicator pins. Retain fractional pulse phase when RSSI
+    // changes, so the flash cadence accelerates smoothly without phase jumps.
+    int prev_led=-1, prev_buzzer=-1;
+    bool had_signal = false;
+    int32_t display_q8 = -127 * 256;
+    uint32_t pulse_phase_q16 = 0;
+    int64_t prior_tick = now_ms();
+    while(1) {
+        int64_t t=now_ms();
+        int64_t dt=t-prior_tick;
+        if (dt < 0) dt = 0;
+        if (dt > 100) dt = 100; // don't fast-forward animations after stalls
+        prior_tick=t;
+        int u=ANIM_UNIT_MS;
+        bool on=false, beep=false;
+        if (fault_latched || (sos_preview && t < preview_until_ms)) {
+            // Morse SOS (unchanged from v0.1.2). Fatal faults always win.
+            int d[18]; int n=0;
+            for(int j=0;j<9;j++) { d[n++]=(j>=3&&j<6)?3*u:u; if(j<8) d[n++]=(j==2||j==5)?3*u:u; }
+            int64_t active=27*u;
+            int64_t phase=t%(active+1000);
+            on=pattern_on(phase,d,n);
+            beep=on && WTF_BUZZER_ON_FAULT;
+        } else if (t<boot_until_ms) {
+            int d[]={u,u,u,u,u}; on=pattern_on(t-(boot_until_ms-5*u),d,5);
+        } else if (t<selftest_until_ms) {
+            int d[]={u,u,u}; on=pattern_on(t%WTF_SELFTEST_INTERVAL_MS,d,3);
+        } else if (t<alert_until_ms) {
+            int d[]={u,u,u,u,u}; on=pattern_on(t-(alert_until_ms-5*u),d,5);
+            beep=on && WTF_BUZZER_ON_DETECTION;
+        } else {
+            int r=-127, peak=-127, votes=0;
+            int64_t seen=0, peak_until=0;
+            taskENTER_CRITICAL(&detection_lock);
+            r=last_rssi; seen=last_seen_ms;
+            peak=peak_rssi; peak_until=peak_hold_until_ms;
+            votes=trend_score;
+            taskEXIT_CRITICAL(&detection_lock);
+            const int64_t age = t-seen;
+            if(seen && age >= 0 && age < WTF_TRACK_TIMEOUT_MS) {
+                int target = r;
+                // Hold recent strong measurements briefly, then decay the
+                // visual indication. Silence is not a measured falling RSSI.
+                if (t < peak_until && peak > target) target = peak;
+                if (age > WTF_RSSI_SILENCE_GRACE_MS)
+                    target -= (int)((age-WTF_RSSI_SILENCE_GRACE_MS) *
+                                    WTF_RSSI_SILENCE_FADE_DB_PER_S / 1000);
+                if (target < -95) target=-95;
+                if (!had_signal) {
+                    display_q8 = target * 256;
+                    pulse_phase_q16 = 0;
+                    had_signal=true;
+                } else if (target * 256 > display_q8) {
+                    display_q8=target * 256; // stronger: quick response
+                } else {
+                    // Smooth decline at ~18 dBm/s, regardless of packet rate.
+                    int32_t drop=(int32_t)((dt * WTF_RSSI_FALL_DB_PER_S * 256 + 999)/1000);
+                    int32_t floor_q8=target*256;
+                    display_q8 = display_q8-drop > floor_q8 ? display_q8-drop : floor_q8;
+                }
+                const int shown = (int)(display_q8 / 256);
+                const int interval=wtf_rssi_interval_ms(shown);
+                if (interval == 0) {
+                    on=true; // solid = strong RSSI, NOT a distance guarantee
+                } else {
+                    pulse_phase_q16 = wtf_phase_advance_q16(pulse_phase_q16,
+                                                                 dt,interval);
+                    // Two ticks when the selected MAC's RSSI has *measurably*
+                    // weakened; packet silence alone does not assert recession.
+                    on = wtf_strength_led_on(pulse_phase_q16, interval, u,
+                          votes <= -2 && age < WTF_RSSI_TREND_STALE_MS);
+                }
+            } else {
+                had_signal=false;
+                pulse_phase_q16=0;
+                on=(t%WTF_SCANNING_INTERVAL_MS)<u;
+            }
+        }
+#if HAS_LED
+        if((int)on!=prev_led) { gpio_set_level(USER_LED_GPIO,on?LED_ON:LED_OFF);prev_led=on; }
+#endif
+#if WTF_ENABLE_BUZZER
+        if((int)beep!=prev_buzzer) {gpio_set_level(USER_BUZZER_GPIO,beep?BUZZER_ON:BUZZER_OFF);prev_buzzer=beep;}
+#else
+        (void)beep;(void)prev_buzzer;
+#endif
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+
+#if WTF_ENABLE_DEBUG_CONSOLE
 static void dump_logs_to_console(void) {
     ESP_LOGI(TAG, "--- START OF FLASH LOGS ---");
 
@@ -78,6 +371,7 @@ static void dump_logs_to_console(void) {
     fclose(f);
     ESP_LOGI(TAG, "--- END OF FLASH LOGS ---");
 }
+#endif
 
 static void init_spiffs(void) {
     ESP_LOGI(TAG, "Initializing SPIFFS");
@@ -86,7 +380,7 @@ static void init_spiffs(void) {
       .base_path = "/spiffs",
       .partition_label = "storage",
       .max_files = 5,
-      .format_if_mount_failed = true
+      .format_if_mount_failed = false
     };
 
     esp_err_t ret = esp_vfs_spiffs_register(&conf);
@@ -98,24 +392,41 @@ static void init_spiffs(void) {
         } else {
             ESP_LOGE(TAG, "Failed to initialize SPIFFS (%s)", esp_err_to_name(ret));
         }
+        wtf_report_fault(WTF_F_SPIFFS, diagnostic_mode ? WTF_FATAL : WTF_DEGRADED, ret);
         return;
     }
 
+    spiffs_ready = true;
     size_t total = 0, used = 0;
     ret = esp_spiffs_info("storage", &total, &used);
     if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "Partition size: total: %d, used: %d", total, used);
+        ESP_LOGI(TAG, "Partition size: total: %zu, used: %zu", total, used);
+    } else {
+        wtf_report_fault(WTF_F_SPIFFS, WTF_DEGRADED, ret);
     }
 }
 
-static void append_log(const char* log_line) {
-    FILE* f = fopen("/spiffs/detections.txt", "a");
-    if (f == NULL) {
-        ESP_LOGE(TAG, "Failed to open log file for writing");
-        return;
+static void logger_task(void *arg) {
+    char record[180];
+    bool write_error_reported = false;
+    while(1) {
+        if(xQueueReceive(log_queue,record,portMAX_DELAY)==pdTRUE && spiffs_ready) {
+            FILE *f=fopen("/spiffs/detections.txt","a");
+            if (!f) {
+                if (!write_error_reported)
+                    wtf_report_fault(WTF_F_LOGGING, WTF_DEGRADED, -1);
+                write_error_reported = true;
+            } else {
+                int wrote = fprintf(f, "%s\n", record);
+                int closed = fclose(f);
+                if (wrote < 0 || closed != 0) {
+                    if (!write_error_reported)
+                        wtf_report_fault(WTF_F_LOGGING, WTF_DEGRADED, -2);
+                    write_error_reported = true;
+                } else write_error_reported = false;
+            }
+        }
     }
-    fprintf(f, "%s\n", log_line);
-    fclose(f);
 }
 
 // WiFi SSID patterns to detect (case-insensitive)
@@ -210,27 +521,10 @@ static bool extract_source_mac(const uint8_t *frame, uint8_t *src_mac)
     return false;
 }
 
-static void indicator_task(void *pvParameters) {
-    ESP_LOGI(TAG, "Indicator task running on core %d", xPortGetCoreID());
-    while (1) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-
-#if HAS_LED
-        gpio_set_level(USER_LED_GPIO, LED_ON);
-#endif
-        gpio_set_level(USER_BUZZER_GPIO, BUZZER_ON);
-
-        vTaskDelay(pdMS_TO_TICKS(80));
-
-#if HAS_LED
-        gpio_set_level(USER_LED_GPIO, LED_OFF);
-#endif
-        gpio_set_level(USER_BUZZER_GPIO, BUZZER_OFF);
-    }
-}
-
 static int ble_monitor_event(struct ble_gap_event *event, void *arg) {
+    if (!ble_enabled) return 0;
     if (event->type == BLE_GAP_EVENT_DISC) {
+        __atomic_fetch_add(&ble_rx_adverts, 1, __ATOMIC_RELAXED);
         struct ble_hs_adv_fields fields;
         int rc = ble_hs_adv_parse_fields(&fields, event->disc.data, event->disc.length_data);
         if (rc != 0) return 0;
@@ -302,9 +596,8 @@ static int ble_monitor_event(struct ble_gap_event *event, void *arg) {
                      name[0] ? name : "N/A", event->disc.rssi);
 
             ESP_LOGW("DETECTION", ">>> %s <<<", log_buf);
-            append_log(log_buf); // Write to Flash
-
-            if (led_task_handle != NULL) xTaskNotifyGive(led_task_handle);
+            uint8_t id[6]; for(int i=0;i<6;i++) id[i]=event->disc.addr.val[5-i];
+            observe_detection(2,id,event->disc.rssi,log_buf);
         }
     }
     return 0;
@@ -312,6 +605,9 @@ static int ble_monitor_event(struct ble_gap_event *event, void *arg) {
 
 static void wifi_sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     const wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
+    if (!wifi_enabled || !buf) return;
+    __atomic_fetch_add(&wifi_rx_packets, 1, __ATOMIC_RELAXED);
+    if (pkt->rx_ctrl.sig_len < 38) return;
     const uint8_t *payload = pkt->payload;
     uint8_t src_mac[6];
     bool has_mac = extract_source_mac(payload, src_mac);
@@ -321,7 +617,7 @@ static void wifi_sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
         uint8_t tag_type = payload[36];
         uint8_t tag_len = payload[37];
 
-        if (tag_type == 0 && tag_len > 0) {
+        if (tag_type == 0 && tag_len > 0 && pkt->rx_ctrl.sig_len >= 38 + tag_len) {
             char ssid[33] = {0};
             memcpy(ssid, &payload[38], tag_len > 32 ? 32 : tag_len);
 
@@ -343,9 +639,7 @@ static void wifi_sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
 
                     ESP_LOGW("DETECTION", ">>> %s <<<", log_buf);
 
-                    append_log(log_buf);
-
-                    if (led_task_handle != NULL) xTaskNotifyGive(led_task_handle);
+                    if(has_mac) observe_detection(1,src_mac,pkt->rx_ctrl.rssi,log_buf);
                 }
             }
         }
@@ -370,115 +664,364 @@ static void wifi_sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
 
             ESP_LOGW("DETECTION", ">>> %s <<<", log_buf);
 
-            append_log(log_buf);
-
-            if (led_task_handle != NULL) xTaskNotifyGive(led_task_handle);
+            observe_detection(1,src_mac,pkt->rx_ctrl.rssi,log_buf);
         }
     }
 }
 
 static void wifi_init_sniffer(void)
 {
-    esp_netif_init();
-    esp_event_loop_create_default();
+    esp_err_t err = esp_netif_init();
+    if (err != ESP_OK) { wtf_report_fault(WTF_F_WIFI,WTF_FATAL,err); return; }
+    err = esp_event_loop_create_default();
+    if (err != ESP_OK) { wtf_report_fault(WTF_F_WIFI,WTF_FATAL,err); return; }
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    // ESP_ERROR_CHECK would abort before SOS could display the fault.
+#define WTF_WIFI_CHECK(call) do { \
+        err = (call); \
+        if (err != ESP_OK) { wtf_report_fault(WTF_F_WIFI,WTF_FATAL,err); return; } \
+    } while (0)
+    WTF_WIFI_CHECK(esp_wifi_init(&cfg));
+    WTF_WIFI_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    WTF_WIFI_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    WTF_WIFI_CHECK(esp_wifi_start());
+    WTF_WIFI_CHECK(esp_wifi_set_promiscuous(false));
+    WTF_WIFI_CHECK(esp_wifi_set_promiscuous_rx_cb(wifi_sniffer_cb));
+    WTF_WIFI_CHECK(esp_wifi_set_promiscuous(true));
+#undef WTF_WIFI_CHECK
 
-    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    ESP_ERROR_CHECK(esp_wifi_set_promiscuous(false));
-    ESP_ERROR_CHECK(esp_wifi_set_promiscuous_rx_cb(wifi_sniffer_cb));
-    ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
-
+    wifi_ready = true;
     ESP_LOGI(TAG, "WiFi promiscuous mode enabled with MAC filtering");
 }
 
 static void ble_host_task(void *param) {
     ESP_LOGI(TAG, "BLE host task running on core %d", xPortGetCoreID());
-    nimble_port_run();
+    (void)param;
+    nimble_port_run(); // returns only when the host is stopped
+    // The scanner is expected to run continuously in this firmware.
+    if (ble_enabled && !fault_latched)
+        wtf_report_fault(WTF_F_BLE, WTF_FATAL, -1);
     nimble_port_freertos_deinit();
 }
 
+static int ble_start_scan(void) {
+    struct ble_gap_disc_params disc_params={0};
+    disc_params.filter_duplicates=1;
+    disc_params.passive=0;
+    disc_params.itvl=128;
+    disc_params.window=40;
+    return ble_gap_disc(BLE_OWN_ADDR_PUBLIC,BLE_HS_FOREVER,&disc_params,ble_monitor_event,NULL);
+}
+static void ble_on_sync(void) {
+    if(!ble_enabled) return;
+    int rc=ble_start_scan();
+    ble_ready=(rc==0);
+    if (rc) wtf_report_fault(WTF_F_BLE, WTF_FATAL, rc);
+    else ESP_LOGI(TAG,"BLE scanning started");
+}
 static void ble_init_monitor(void) {
-    ESP_ERROR_CHECK(nimble_port_init());
-
-    struct ble_gap_disc_params disc_params = {0};
-    disc_params.filter_duplicates = 1;
-    disc_params.passive = 0;
-    disc_params.itvl = 128;
-    disc_params.window = 40;
-
+    esp_err_t err=nimble_port_init();
+    if (err != ESP_OK) {wtf_report_fault(WTF_F_BLE,WTF_FATAL,err);return;}
+    ble_hs_cfg.sync_cb=ble_on_sync;
     nimble_port_freertos_init(ble_host_task);
-
-    // Start discovery
-    ble_gap_disc(BLE_ADDR_PUBLIC, BLE_HS_FOREVER, &disc_params, ble_monitor_event, NULL);
 }
 
 static void channel_hop_task(void *arg)
 {
     ESP_LOGI(TAG, "Channel hop task running on core %d", xPortGetCoreID());
     uint8_t channel = 1;
+    unsigned consecutive_errors = 0;
+    bool reported_error = false;
+    // NimBLE initializes asynchronously. Catch a missing sync in normal mode too.
+    const int64_t ble_sync_deadline = now_ms() + 7000;
+    bool ble_sync_checked = false;
 
     while (1) {
-        esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+        if (!ble_sync_checked && now_ms() >= ble_sync_deadline) {
+            ble_sync_checked = true;
+            if (!ble_ready && ble_enabled && !fault_latched)
+                wtf_report_fault(WTF_F_BLE, WTF_FATAL, -2);
+        }
+        if (wifi_enabled && wifi_ready) {
+            esp_err_t err = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+            if (err != ESP_OK) {
+                if (++consecutive_errors >= 3 && !reported_error) {
+                    wtf_report_fault(WTF_F_WIFI_HOP,WTF_DEGRADED,err);
+                    reported_error = true;
+                }
+            } else {
+                consecutive_errors = 0;
+                reported_error = false;
+            }
+        }
         channel = (channel % 13) + 1;
         ESP_LOGD(TAG, ">> CHANNEL: %d <<", channel);
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
 
-void app_main(void)
-{
-    #if ENABLE_EXT_ANTENNA
-        // External antenna for C6
-        gpio_reset_pin(EXT_ANT_PIN1);
-        gpio_reset_pin(EXT_ANT_PIN2);
-        gpio_set_direction(EXT_ANT_PIN1, GPIO_MODE_OUTPUT);
-        gpio_set_direction(EXT_ANT_PIN2, GPIO_MODE_OUTPUT);
-        gpio_set_level(EXT_ANT_PIN1, 0);
-        vTaskDelay(pdMS_TO_TICKS(10));
-        gpio_set_level(EXT_ANT_PIN2, 1);
-    #endif
-    // Conservative NVS Initialization (no auto-erase)
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_LOGE(TAG, "NVS Error (%s): Flash was NOT erased to preserve data.", esp_err_to_name(ret));
-    } else {
-        ESP_ERROR_CHECK(ret);
+#if WTF_ENABLE_DEBUG_CONSOLE
+static void console_task(void *arg) {
+    (void)arg;
+    char line[128];
+    printf("\nWTF v0.1.3 | type help\n"); fflush(stdout);
+    while(1) {
+        printf("wtf> "); fflush(stdout);
+        if(!fgets(line,sizeof(line),stdin)) {clearerr(stdin);vTaskDelay(pdMS_TO_TICKS(150));continue;}
+        line[strcspn(line,"\r\n")]=0;
+        if(!strcmp(line,"help")) {
+            puts("help | status | version | reset | reset reason | logs | logs stats | logs clear CONFIRM");
+            puts("wifi on/off | ble on/off | test selftest | test sos | test fault");
+            puts("test detect <rssi> | test rssi <rssi> | test clear");
+        } else if(!strcmp(line,"version")) {
+            printf("WTF v0.1.3 / %s %s\n",__DATE__,__TIME__);
+        } else if(!strcmp(line,"status")) {
+            int64_t t=now_ms();
+            printf("uptime=%lldms mode=%s wifi=%s ble=%s spiffs=%s fatal=%d fatal_code=F%02u last_code=F%02u detail=%d events=%u rssi=%d detections=%u wifi_rx=%" PRIu32 " ble_rx=%" PRIu32 " trend_votes=%d speed=%d\n",
+                (long long)t,diagnostic_mode?"diagnostic":"normal",
+                wifi_enabled?"on":"off",ble_enabled?"on":"off",spiffs_ready?"ok":"unavailable",
+                fault_latched,(unsigned)fatal_fault_code,(unsigned)last_fault_code,
+                last_fault_detail,fault_events,last_rssi,detection_count,
+                __atomic_load_n(&wifi_rx_packets,__ATOMIC_RELAXED),
+                __atomic_load_n(&ble_rx_adverts,__ATOMIC_RELAXED),trend_score,WTF_ANIMATION_SPEED);
+        } else if(!strcmp(line,"reset reason")) {
+            printf("reset_reason=%d (ESP-IDF esp_reset_reason enum)\n",esp_reset_reason());
+        } else if(!strcmp(line,"reset")) {
+            puts("Rebooting...");fflush(stdout);vTaskDelay(pdMS_TO_TICKS(100));esp_restart();
+        } else if(!strcmp(line,"logs")) {
+            if(spiffs_ready) dump_logs_to_console();else puts("SPIFFS unavailable");
+        } else if(!strcmp(line,"logs stats")) {
+            size_t total=0,used=0;
+            if(spiffs_ready && esp_spiffs_info("storage",&total,&used)==ESP_OK) {
+                struct stat st; long bytes=stat("/spiffs/detections.txt",&st)==0?(long)st.st_size:0;
+                printf("partition=%zu used=%zu log_bytes=%ld\n",total,used,bytes);
+            } else puts("SPIFFS unavailable");
+        } else if(!strcmp(line,"logs clear CONFIRM")) {
+            if(!spiffs_ready) puts("SPIFFS unavailable");
+            else if(remove("/spiffs/detections.txt")==0) puts("Detection log deleted");
+            else puts("No log deleted (missing or error)");
+        } else if(!strcmp(line,"wifi off") || !strcmp(line,"wifi on")) {
+            bool enable=!strcmp(line,"wifi on");
+            if(!wifi_ready) puts("Wi-Fi not initialized");
+            else {esp_err_t err=esp_wifi_set_promiscuous(enable);if(err==ESP_OK){wifi_enabled=enable;puts("Wi-Fi scan state updated");}else {wtf_report_fault(WTF_F_WIFI,WTF_DEGRADED,err);printf("Wi-Fi error: %s\n",esp_err_to_name(err));}}
+        } else if(!strcmp(line,"ble off") || !strcmp(line,"ble on")) {
+            bool enable=!strcmp(line,"ble on");
+            if(!ble_ready) puts("BLE not initialized");
+            else if(!enable) {ble_enabled=false;int rc=ble_gap_disc_cancel();printf("BLE disabled (cancel rc=%d)\n",rc);}
+            else {int rc=ble_start_scan();
+                if(rc==0){ble_enabled=true;puts("BLE scanning enabled");}else {wtf_report_fault(WTF_F_BLE,WTF_DEGRADED,rc);printf("BLE start error %d\n",rc);}}
+        } else if(!strcmp(line,"test selftest")) {
+            if(fault_latched) puts("Fault latched; reset required");
+            else {selftest_until_ms=now_ms()+WTF_SELFTEST_INTERVAL_MS*2;puts("Self-test replay");}
+        } else if(!strcmp(line,"test sos")) {
+            if(fault_latched) puts("Fault already latched");
+            else {sos_preview=true;preview_until_ms=now_ms()+2*(27*ANIM_UNIT_MS+1000);puts("SOS preview (2 cycles)");}
+        } else if(!strcmp(line,"test fault")) {
+            wtf_report_fault(WTF_F_TEST_SOS,WTF_FATAL,0);puts("Fault latched. Use reset to recover.");
+        } else if(!strcmp(line,"test clear")) {
+            sos_preview=false;alert_until_ms=0;
+            wtf_reset_rssi_tracking();
+            puts("Synthetic inputs cleared; latched faults unaffected");
+        } else if(!strncmp(line,"test rssi ",10) || !strncmp(line,"test detect ",12)) {
+            bool detect=!strncmp(line,"test detect ",12);
+            char *p=line+(detect?12:10),*end=NULL;long v=strtol(p,&end,10);
+            if(p==end || *end || v<-127 || v>20) puts("Expected RSSI -127..20");
+            else {static const uint8_t test_mac[6]={0x57,0x54,0x46,0,0,1};
+                wtf_update_rssi(3,test_mac,(int)v);
+                if(detect){alert_until_ms=now_ms()+5*ANIM_UNIT_MS;puts("Synthetic new-detection event; not logged");}
+                else puts("Synthetic RSSI sample processed by live filter (expires in 5 seconds)");}
+        } else if(*line) puts("Unknown command; type help");
     }
+}
+#endif
 
-    init_spiffs();
+// A real, opt-in boot self-test. SPIFFS write/read is checked; Wi-Fi and BLE
+// initialization is checked by their ordinary startup paths; real RF RX is
+// counted during two idle heartbeats (silence is inconclusive, not a fault).
+// The RSSI sweep goes through wtf_update_rssi(), the live measurement filter.
+// It ends by latching the same SOS mechanism used for genuine fatal errors.
+static bool wtf_check_spiffs_rw(void) {
+    if (!spiffs_ready) return false;
+    static const char expected[] = "WTF_DIAG_STORAGE_V1\n";
+    const char *path = "/spiffs/.wtf_diagnostic_probe";
+    FILE *f = fopen(path, "wb");
+    if (!f) return false;
+    bool ok = fwrite(expected, 1, sizeof(expected)-1, f) == sizeof(expected)-1;
+    if (fclose(f) != 0) ok = false;
+    if (!ok) { remove(path); return false; }
+    f = fopen(path, "rb");
+    if (!f) { remove(path); return false; }
+    char buf[sizeof(expected)] = {0};
+    size_t got = fread(buf, 1, sizeof(expected), f);
+    if (ferror(f)) ok = false;
+    if (fclose(f) != 0) ok = false;
+    if (remove(path) != 0) ok = false;
+    return ok && got == sizeof(expected)-1 &&
+           memcmp(buf, expected, sizeof(expected)-1) == 0;
+}
 
-    // Dump all previous detections to Serial
-    dump_logs_to_console();
+// Verify actual source-aware update path, smoothing, trend and mapping math.
+// The same pure functions are independently compiled/run in tests/ on Linux.
+static bool wtf_check_rssi_math(void) {
+    static const uint8_t test_mac[6]={0x57,0x54,0x46,0,0,1};
+    wtf_reset_rssi_tracking();
+    wtf_update_rssi(3,test_mac,-50);
+    wtf_update_rssi(3,test_mac,-90);
+    taskENTER_CRITICAL(&detection_lock);
+    int result = last_rssi;
+    taskEXIT_CRITICAL(&detection_lock);
+    if (result != -60) return false;
+    wtf_update_rssi(3,test_mac,-35);
+    taskENTER_CRITICAL(&detection_lock);
+    result = last_rssi;
+    last_seen_ms = now_ms() - WTF_TRACK_TIMEOUT_MS - 1;
+    taskEXIT_CRITICAL(&detection_lock);
+    if (result != -35) return false;
+    wtf_update_rssi(3,test_mac,-75);
+    taskENTER_CRITICAL(&detection_lock);
+    result = last_rssi;
+    taskEXIT_CRITICAL(&detection_lock);
+    if (result != -75) return false;
+    wtf_reset_rssi_tracking();
+    static const int levels[]  = {-95,-90,-80,-70,-60,-50,-46,-45};
+    static const int periods[] = {3000,2600,1800,1100,565,263,125,0};
+    for (unsigned i = 0; i < sizeof(levels)/sizeof(levels[0]); ++i)
+        if (wtf_rssi_interval_ms(levels[i]) != periods[i]) return false;
+    for (int d=-95;d < -45; ++d)
+        if (wtf_rssi_interval_ms(d+1) >= wtf_rssi_interval_ms(d)) return false;
+    int vote=wtf_trend_vote(0,-80,-75);
+    vote=wtf_trend_vote(vote,-75,-70);
+    if (vote < 2) return false;
+    vote=wtf_trend_vote(vote,-70,-75);
+    vote=wtf_trend_vote(vote,-75,-80);
+    if (vote > -2) return false;
+    if (!wtf_strength_led_on(0, 700, ANIM_UNIT_MS, false)) return false;
+    if (wtf_strength_led_on((uint32_t)(80*65536/700),700,70,false)) return false;
+    if (!wtf_strength_led_on((uint32_t)(150*65536/700),700,70,true)) return false;
+    if (wtf_strength_led_on((uint32_t)(150*65536/700),700,70,false)) return false;
+    if (wtf_phase_advance_q16(0,100,1000) == 0) return false;
+    wtf_reset_rssi_tracking();
+    return true;
+}
 
-    // Initialize GPIOs for indicators
-    #if HAS_LED
-        gpio_reset_pin(USER_LED_GPIO);
-        gpio_set_direction(USER_LED_GPIO, GPIO_MODE_OUTPUT);
-        gpio_set_level(USER_LED_GPIO, LED_OFF);
-    #endif
+static void wtf_diagnostic_task(void *arg) {
+    (void)arg;
+    if (!wtf_check_spiffs_rw()) {
+        wtf_report_fault(WTF_F_SELFTEST, WTF_FATAL, 1); // persistent storage test
+        vTaskDelete(NULL);
+        return;
+    }
+    // NimBLE starts asynchronously; let its host sync callback report ready.
+    int64_t sync_deadline = now_ms() + 7000;
+    while (!ble_ready && !fault_latched && now_ms() < sync_deadline)
+        vTaskDelay(pdMS_TO_TICKS(50));
+    if (fault_latched) {vTaskDelete(NULL);return;}
+    if (!wifi_ready || !ble_ready) {
+        wtf_report_fault(WTF_F_SELFTEST, WTF_FATAL, 2); // radio init/host sync failed
+        vTaskDelete(NULL);
+        return;
+    }
+    if (!wtf_check_rssi_math()) {
+        wtf_report_fault(WTF_F_SELFTEST, WTF_FATAL, 3); // filter or LED thresholds
+        vTaskDelete(NULL);
+        return;
+    }
+    // Two full idle heartbeats, with real Wi-Fi/BLE reception counters active.
+    uint32_t wifi_before = __atomic_load_n(&wifi_rx_packets,__ATOMIC_RELAXED);
+    uint32_t ble_before  = __atomic_load_n(&ble_rx_adverts,__ATOMIC_RELAXED);
+    int64_t deadline = now_ms() + 2 * WTF_SCANNING_INTERVAL_MS;
+    while (now_ms() < deadline && !fault_latched)
+        vTaskDelay(pdMS_TO_TICKS(50));
+    diagnostic_wifi_rx = __atomic_load_n(&wifi_rx_packets,__ATOMIC_RELAXED) - wifi_before;
+    diagnostic_ble_rx = __atomic_load_n(&ble_rx_adverts,__ATOMIC_RELAXED) - ble_before;
+    // Zero RF traffic alone is NOT proof that the receiver failed.
+    ESP_LOGI(TAG, "DIAG radio window: wifi_packets=%" PRIu32 " ble_adverts=%" PRIu32,
+             diagnostic_wifi_rx, diagnostic_ble_rx);
+    if (fault_latched) {vTaskDelete(NULL);return;}
+
+    // Exercise the SAME per-source filter as real radio packets.
+    // 5 dBm increments, with 2s per step rising and 1.5s falling.
+    static const uint8_t test_mac[6]={0x57,0x54,0x46,0,0,1};
+    wtf_reset_rssi_tracking();
+    for (int dbm=-95; dbm <= -45 && !fault_latched; dbm+=5) {
+        for (int n=0; n<8 && !fault_latched; ++n) {
+            wtf_update_rssi(3,test_mac,dbm);
+            vTaskDelay(pdMS_TO_TICKS(250));
+        }
+    }
+    // Maximum strength is a relative indication; hold solid for two seconds.
+    for (int n=0; n<8 && !fault_latched; ++n) {
+        wtf_update_rssi(3,test_mac,-45);
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+    // Deliberately weaken the SAME source so the receding double-tick
+    // path runs before the final SOS. No synthetic entries are logged.
+    for (int dbm=-50; dbm >= -95 && !fault_latched; dbm-=5) {
+        for (int n=0; n<6 && !fault_latched; ++n) {
+            wtf_update_rssi(3,test_mac,dbm);
+            vTaskDelay(pdMS_TO_TICKS(250));
+        }
+    }
+    // Allow the fading-on-silence behavior to run without new samples.
+    if (!fault_latched) vTaskDelay(pdMS_TO_TICKS(2000));
+    if (!fault_latched) {
+        // Diagnostic ONLY: deliberate SOS latch, not a real system failure.
+        wtf_report_fault(WTF_F_TEST_SOS, WTF_FATAL, 0);
+    }
+    vTaskDelete(NULL);
+}
+
+void app_main(void) {
+#if ENABLE_EXT_ANTENNA
+    gpio_reset_pin(EXT_ANT_PIN1);gpio_reset_pin(EXT_ANT_PIN2);
+    gpio_set_direction(EXT_ANT_PIN1,GPIO_MODE_OUTPUT);gpio_set_direction(EXT_ANT_PIN2,GPIO_MODE_OUTPUT);
+    gpio_set_level(EXT_ANT_PIN1,0);gpio_set_level(EXT_ANT_PIN2,1);
+#endif
+#if HAS_LED
+    esp_err_t led_err = gpio_reset_pin(USER_LED_GPIO);
+    if (led_err == ESP_OK) led_err = gpio_set_level(USER_LED_GPIO,LED_OFF);
+    if (led_err == ESP_OK) led_err = gpio_set_direction(USER_LED_GPIO,GPIO_MODE_OUTPUT);
+    if (led_err != ESP_OK) wtf_report_fault(WTF_F_GPIO,WTF_FATAL,led_err);
+#endif
+#if WTF_ENABLE_BUZZER
     gpio_reset_pin(USER_BUZZER_GPIO);
-    gpio_set_direction(USER_BUZZER_GPIO, GPIO_MODE_OUTPUT);
-    gpio_set_level(USER_BUZZER_GPIO, BUZZER_OFF);
+    gpio_set_level(USER_BUZZER_GPIO,BUZZER_OFF);
+    gpio_set_direction(USER_BUZZER_GPIO,GPIO_MODE_OUTPUT);
+#endif
+    diagnostic_mode = wtf_diagnostic_jumper_present();
+    int64_t t = now_ms();
+    boot_until_ms = t + 5 * ANIM_UNIT_MS;
+    selftest_until_ms = diagnostic_mode ? boot_until_ms : boot_until_ms + 2*WTF_SELFTEST_INTERVAL_MS;
+    if (xTaskCreate(indicator_task,"indicator",3072,NULL,5,NULL) != pdPASS)
+        wtf_report_fault(WTF_F_TASK,WTF_FATAL,1); // no LED indication if task cannot start
 
-    xTaskCreate(indicator_task, "indicator_task", 2048, NULL, 10, &led_task_handle);
-
-    // Start scanning systems
-    wifi_init_sniffer();
-    ble_init_monitor();
-
-    // Start background channel hopping
-    xTaskCreate(channel_hop_task, "channel_hop", 2048, NULL, 5, NULL);
-
-    // Boot Complete Signal (Double Flash/Beep)
-    if (led_task_handle != NULL) {
-        xTaskNotifyGive(led_task_handle);
-        vTaskDelay(pdMS_TO_TICKS(200));
-        xTaskNotifyGive(led_task_handle);
+    esp_err_t ret = nvs_flash_init();
+    if (ret != ESP_OK) wtf_report_fault(WTF_F_NVS,WTF_FATAL,ret);
+    if (!fault_latched) init_spiffs();
+    // Headless by default: SPIFFS history is retained, not dumped on boot.
+    log_queue = xQueueCreate(32,180);
+    if (log_queue) {
+        if (xTaskCreate(logger_task,"logger",4096,NULL,4,NULL) != pdPASS)
+            wtf_report_fault(WTF_F_TASK,WTF_FATAL,2);
+    } else {
+        wtf_report_fault(WTF_F_LOGGING,WTF_FATAL,0);
     }
-    ESP_LOGW(TAG, "Beep Beep, we're good to go.");
+    if (!fault_latched) {
+        wifi_init_sniffer();
+        if (wifi_ready) ble_init_monitor();
+        if (wifi_ready && !fault_latched &&
+            xTaskCreate(channel_hop_task,"channel_hop",2048,NULL,5,NULL) != pdPASS)
+            wtf_report_fault(WTF_F_TASK,WTF_FATAL,3);
+    }
+#if WTF_ENABLE_DEBUG_CONSOLE
+    if (xTaskCreate(console_task,"console",4096,NULL,3,NULL) != pdPASS)
+        wtf_report_fault(WTF_F_TASK,WTF_DEGRADED,4);
+#endif
+    if (diagnostic_mode && !fault_latched) {
+        if (xTaskCreate(wtf_diagnostic_task,"diagnostic",4096,NULL,3,NULL) != pdPASS)
+            wtf_report_fault(WTF_F_TASK,WTF_FATAL,5);
+    }
+    ESP_LOGI(TAG,"v0.1.3 ready; boot_mode=%s LED_GPIO=%d speed=%d",
+             diagnostic_mode?"diagnostic":"normal",USER_LED_GPIO,WTF_ANIMATION_SPEED);
 }
