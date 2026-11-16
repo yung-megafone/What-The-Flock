@@ -46,4 +46,5 @@ int main(void) {
     assert(phase2 > phase);  // interval change preserves fractional phase
     puts("PASS: 50 distinct RSSI intervals, filter, trend, LED duty, phase continuity");
     return 0;
+    //   Is there a better way to test this? 
 }
