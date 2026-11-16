@@ -1,10 +1,10 @@
 #pragma once
-// XIAO ESP32-C5 prototype defaults. Verify onboard LED GPIO/polarity on hardware.
+// XIAO ESP32-C5 prototype defaults
 #define WTF_LED_GPIO 27
 #define WTF_ENABLE_BUZZER 0
 #define WTF_BUZZER_ON_DETECTION 1
 #define WTF_BUZZER_ON_FAULT 1
-#define WTF_ENABLE_DEBUG_CONSOLE 1
+#define WTF_ENABLE_DEBUG_CONSOLE 0
 #define WTF_ANIMATION_SPEED 1 // 1 fast (70 ms), 10 slow (200 ms)
 #define WTF_SELFTEST_INTERVAL_MS 4000 // FIXED: not affected by speed
 #define WTF_SCANNING_INTERVAL_MS 5000 // FIXED: not affected by speed
