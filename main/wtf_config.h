@@ -13,5 +13,17 @@
 
 // Boot-only offline diagnostics: XIAO ESP32-C5 D10 is GPIO10.
 // Connect D10 -> GND BEFORE reset to enable; leave open for normal operation.
+// Never jumper D10 to 5V; the board uses 3.3V logic.
 #define WTF_ENABLE_BOOT_DIAGNOSTICS 1
 #define WTF_DIAGNOSTIC_GPIO 10
+
+// proximity display (these are NOT calibrated distances).
+// Strongest RSSI reaches solid LED at -45 dBm; pulse speed is continuous.
+// Retain a strong peak briefly, then visibly decelerate when readings weaken.
+#define WTF_RSSI_PEAK_HOLD_MS 900
+#define WTF_RSSI_FALL_DB_PER_S 18
+#define WTF_RSSI_SILENCE_GRACE_MS 1000
+#define WTF_RSSI_SILENCE_FADE_DB_PER_S 9
+#define WTF_RSSI_TREND_STALE_MS 2000
+#define WTF_RSSI_SOURCE_HOLD_MS 1250
+#define WTF_RSSI_SOURCE_SWITCH_DB 5
