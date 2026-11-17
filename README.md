@@ -1,12 +1,49 @@
-# What The Flock (WTF)
+<div align="center">
 
-**Headless Wi-Fi/Bluetooth LE signature monitoring for the Seeed Studio XIAO ESP32-C5.**
+# WHAT THE FLOCK
+### Headless Wi-Fi + BLE signature detector
 
-What The Flock (WTF) is an experimental ESP-IDF firmware project that listens for selected wireless identifiers associated with Flock-style surveillance equipment and provides a visual, RSSI-based indication when a configured signature is observed. Potential detections can be recorded to on-board SPIFFS storage.
+**ESP32-C5 firmware · Adaptive scanning · RSSI indication · Offline diagnostics**
 
-This repository is a fork of [spuder/What-The-Flock](https://github.com/spuder/What-The-Flock), itself described as an ESP-IDF port of the original *Flock You* project. **Credit for the original project and signatures belongs to their respective authors.** This fork's current development target is the **Seeed Studio XIAO ESP32-C5**, with a focus on autonomous operation, offline diagnostics, and improved signal-strength feedback.
+[![Development](https://img.shields.io/badge/Release-v0.1.4--dev-ffb000?style=for-the-badge)](https://github.com/yung-megafone/What-The-Flock/branches)
+[![Platform](https://img.shields.io/badge/Board-XIAO%20ESP32--C5-2868c7?style=for-the-badge)](https://wiki.seeedstudio.com/xiao_esp32c5_getting_started/)
+[![Framework](https://img.shields.io/badge/ESP--IDF-5.5.x-cc2020?style=for-the-badge)](https://docs.espressif.com/projects/esp-idf/en/stable/esp32c5/)
+[![Source](https://img.shields.io/badge/Source-Open%20Research-444?style=for-the-badge)](https://github.com/yung-megafone/What-The-Flock)
 
-> **Prototype status — v0.1.3:** The ESP32-C5 build, boot-time jumper diagnostics, LED patterns, SPIFFS initialization, and synthetic RSSI sweep have been exercised on hardware. Detection of actual surveillance-camera transmissions, false-positive rates, and usable range **have not yet been independently validated**. A matching wireless signature is an indicator, not proof of device identity or physical proximity.
+[**Features**](#features) · [**Hardware**](#hardware) · [**Install**](#build) · [**Self-test**](#offline-hardware-self-test-d10-jumper) · [**RF Testbench**](#controlled-rf-testbench)
+
+**A standalone receiver. No companion transmitter required.**
+
+</div>
+
+---
+
+> [!IMPORTANT]
+> **Development status:** v0.1.4 has been built and exercised on XIAO ESP32-C5 hardware using a controlled `WTF-LAB-01` transmitter, including profile selection and real over-the-air RSSI response. Detection accuracy against real Flock hardware, false positives and range **remain unverified**. A wireless signature match does not prove device identity.
+
+## Project dashboard
+
+| | What-The-Flock |
+|:--|:--|
+| **Purpose** | Passive signature detection and relative RSSI feedback |
+| **Target** | Seeed Studio XIAO ESP32-C5 |
+| **Wi-Fi scanning** | P1: priority 1/6/11 · P2: mixed priority · P3: 1–13 wide |
+| **Profile control** | D5 to GND · 11/12/13 LED flashes · persists in NVS |
+| **Diagnostics** | D10 to GND at boot · offline checks and synthetic RSSI sweep |
+| **Data storage** | SPIFFS detection log when available |
+| **Companion** | [WTF-RF-Testbench](https://github.com/yung-megafone/WTF-RF-Testbench) (optional) |
+
+---
+
+## v0.1.4 development update
+
+This revision is built directly on the supplied working v0.1.3 archive. **The v0.1.4 firmware has passed host-side tests and was built and exercised on physical ESP32-C5 hardware with the separate RF testbench.** The original v0.1.3 board remains a useful rollback/reference. Channel-lock transition timing still needs independently logged validation.
+
+- **Adaptive scanning:** P1 prioritizes only 1/6/11; P2 spends 6 of every 7 slots on 1/6/11, with the seventh rotating through remaining 2.4 GHz channels; P3 scans channels 1–13 equally. Dwell is approximately 125 ms for P1/P2, 110 ms for P3. This is one radio: no simultaneous off-channel monitoring.
+- **Conservative temporary lock:** A recognized Wi-Fi SSID signature can lock immediately, while an OUI-only match requires two observations of the same source on the same channel within 1.2 seconds. Locks expire after 1.8 seconds of silence or 4.5 seconds maximum, followed by a 500 ms reacquisition cooldown. These are initial experimental settings.
+- **Persistent profiles:** Press a normally-open button connecting D5/GPIO24 to GND to cycle P1 → P2 → P3 → P1. The selected profile is written to NVS and restored on reboot; default is P2. Press and release for each change; do not leave the jumper permanently grounded.
+- **LED acknowledgment:** At normal boot and each profile change the LED emits 10 short flashes, pauses 300 ms, then flashes the profile number (1–3). SOS retains highest priority. Acknowledgment temporarily supersedes other LED indications but does not stop RF scanning.
+- **Lab mode:** `WTF_ACCEPT_LAB_BEACONS` is **off by default**. Enable only on a development detector to recognize beacons from the companion `WTF-RF-Testbench` without adding fake detection logs.
 
 ## Features
 
@@ -25,6 +62,7 @@ This repository is a fork of [spuder/What-The-Flock](https://github.com/spuder/W
 | Development board | Seeed Studio XIAO ESP32-C5 |
 | Status indicator | Onboard user LED, GPIO27 (active-low) |
 | Diagnostic jumper | **D10 / GPIO10 → GND** before reset |
+| Profile button | **D5 / GPIO24 → GND** momentary switch; internal pull-up |
 | Diagnostic input when open | Internal pull-up selects normal operation |
 | Buzzer | Disabled by default (`WTF_ENABLE_BUZZER=0`) |
 | Radio | Integrated Wi-Fi and Bluetooth LE |
@@ -39,6 +77,7 @@ Earlier upstream hardware targets include ESP32-C6, C3, and S3; **those boards a
 | Indication | Meaning |
 | --- | --- |
 | Three brief flashes during boot | Startup animation |
+| 10 flashes, pause, 1–3 flashes | Current saved scan profile P1/P2/P3; also shown on profile change |
 | Normal periodic heartbeat (5-second interval) | Idle / scanning indication |
 | Short alert pattern | New matching transmitter (subject to cooldown) |
 | Pulses gradually speeding up | Stronger *relative* RSSI from tracked source |
@@ -143,7 +182,7 @@ cd ~/What-The-Flock
 ./tests/run-host-tests.sh
 ```
 
-The runner compiles [`tests/test_signal_math.c`](tests/test_signal_math.c) against [`main/wtf_signal_math.h`](main/wtf_signal_math.h) using a host C compiler. Passing host tests does not establish radio signature accuracy.
+The runner compiles RSSI and scheduler tests (`test_signal_math.c` and `test_scan_math.c`) against the production math headers using a host C compiler. Passing host tests does not establish RF reception quality or real-world signature accuracy.
 
 ## Logging and diagnostics limitations
 
@@ -160,8 +199,10 @@ main/
   main.c                 Wi-Fi/BLE monitoring, detection, storage, indicators, diagnostics
   wtf_config.h           GPIOs, feature toggles, RSSI and timing settings
   wtf_signal_math.h      RSSI filtering, interpolation, trend and pulse math
+  wtf_scan_math.h        Profile schedules, confidence and lock expiry
 tests/
-  test_signal_math.c     Host-side unit tests
+  test_signal_math.c     Host-side RSSI unit tests
+  test_scan_math.c       Host-side scheduler unit tests
   run-host-tests.sh      Test runner
 tools/
   build-flash-headless.sh
@@ -172,8 +213,15 @@ sdkconfig.defaults        ESP-IDF defaults
 
 Main configuration values are in [`main/wtf_config.h`](main/wtf_config.h). In particular, the GPIO10 diagnostic selector, GPIO27 LED, five-second scanning heartbeat, and RSSI behavior can be adjusted there. Avoid enabling the debug console on this prototype until the USB issue is resolved.
 
+## Controlled RF testbench
+
+The standalone companion project is included in `WTF-RF-Testbench/` **alongside** the detector source in the development ZIP, not nested inside the firmware build. It emits a clearly labeled `WTF-LAB-01` AP beacon, defaults to channel 6, and cycles channels 6/11/1 with its D5 button. Change `LAB_TX_QDBM` and rebuild for a controlled transmit-power test. No real camera identity is cloned. See its own README. This is a development aid, not a proof of live Flock detection.
+
 ## Roadmap / known issues
 
+- [ ] Hardware-build and validate the v0.1.4 adaptive scheduler and button/NVS functions.
+- [ ] Add reliable packet-level capture and timestamped lock metrics for lab benchmarking.
+- [ ] Add one-shot and runtime-adjustable TX power to the companion testbench.
 - [ ] Investigate USB-Serial/JTAG connection-triggered stalls and make the debug console safe.
 - [ ] Refine the aggressive transition between solid LED and very fast pulses at high RSSI.
 - [ ] Validate live signature detection against known, authorized test sources and assess false positives.
