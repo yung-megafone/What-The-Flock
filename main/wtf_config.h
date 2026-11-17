@@ -17,6 +17,9 @@
 #define WTF_ENABLE_BOOT_DIAGNOSTICS 1
 #define WTF_DIAGNOSTIC_GPIO 10
 
+// Momentary button D5(GPIO24)->GND. Selects P1/P2/P3, persists in NVS.
+#define WTF_PROFILE_BUTTON_GPIO 24
+
 // proximity display (these are NOT calibrated distances).
 // Strongest RSSI reaches solid LED at -45 dBm; pulse speed is continuous.
 // Retain a strong peak briefly, then visibly decelerate when readings weaken.
@@ -27,3 +30,7 @@
 #define WTF_RSSI_TREND_STALE_MS 2000
 #define WTF_RSSI_SOURCE_HOLD_MS 1250
 #define WTF_RSSI_SOURCE_SWITCH_DB 5
+
+// Lab-only signature acceptance for controlled WTF-LAB-01 AP beacons.
+// Keep OFF for field firmware to avoid false positives.
+#define WTF_ACCEPT_LAB_BEACONS 0
