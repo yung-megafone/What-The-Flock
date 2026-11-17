@@ -8,6 +8,7 @@
 #include "esp_rom_sys.h"
 #include "wtf_config.h"
 #include "wtf_signal_math.h"
+#include "wtf_scan_math.h"
 #include <string.h>
 
 #include "esp_event.h"
@@ -19,6 +20,7 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "driver/gpio.h"
 
 // BLE Headers
@@ -110,6 +112,24 @@ static bool sos_preview = false;
 static bool diagnostic_mode = false; // sampled once at boot; never polled afterward
 static volatile uint32_t wifi_rx_packets = 0;
 static volatile uint32_t ble_rx_adverts = 0;
+
+// Scan profile and lock state. Callback writes are short and protected;
+// the scheduler performs all Wi-Fi driver channel changes in its own task.
+static portMUX_TYPE scan_lock_mux = portMUX_INITIALIZER_UNLOCKED;
+static volatile uint8_t selected_scan_profile = WTF_SCAN_P2_BALANCED;
+static uint8_t active_wifi_channel = 0;
+static uint8_t match_channel = 0;
+static uint8_t match_mac[6];
+static unsigned match_count = 0;
+static int64_t match_first_ms = 0, match_last_ms = 0;
+static int64_t channel_lock_started_ms = 0, lock_cooldown_until_ms = 0;
+static bool channel_locked = false;
+static volatile uint32_t channel_lock_count = 0;
+static volatile uint32_t channel_unlock_count = 0;
+static volatile uint32_t matched_wifi_packets = 0;
+static volatile uint8_t profile_ack_value = 0;
+static volatile int64_t profile_ack_start_ms = 0;
+
 static uint32_t diagnostic_wifi_rx = 0, diagnostic_ble_rx = 0;
 static int64_t preview_until_ms = 0;
 static int64_t alert_until_ms = 0;
@@ -253,6 +273,68 @@ static void observe_detection(int kind, const uint8_t mac[6], int rssi, const ch
     }
 }
 
+// Snapshot a fresh matching Wi-Fi transmission. Never lock from raw traffic.
+// A credible SSID match (confidence 2) immediately qualifies; an OUI-only
+// match (confidence 1) requires two observations from the same MAC and channel.
+static void wtf_scan_note_match(const uint8_t mac[6], uint8_t channel, int confidence) {
+    if (diagnostic_mode || !mac || channel < 1 || channel > 13) return;
+    const int64_t t = now_ms();
+    __atomic_fetch_add(&matched_wifi_packets, 1, __ATOMIC_RELAXED);
+    taskENTER_CRITICAL(&scan_lock_mux);
+    if (!channel_locked && t >= lock_cooldown_until_ms) {
+        bool same = match_channel == channel &&
+                    memcmp(match_mac, mac, sizeof(match_mac)) == 0 &&
+                    t >= match_first_ms &&
+                    t - match_first_ms <= WTF_SCAN_CANDIDATE_WINDOW_MS;
+        if (!same) {
+            memcpy(match_mac, mac, sizeof(match_mac));
+            match_channel = channel;
+            match_first_ms = t;
+            match_count = 0;
+        }
+        if (match_count < 255) ++match_count;
+        if (wtf_scan_candidate_ready(confidence, match_count, t, match_first_ms)) {
+            channel_locked = true;
+            channel_lock_started_ms = t;
+            match_last_ms = t;
+            ++channel_lock_count;
+        }
+    } else if (channel_locked && channel == match_channel &&
+               memcmp(match_mac, mac, sizeof(match_mac)) == 0) {
+        match_last_ms = t;
+    }
+    taskEXIT_CRITICAL(&scan_lock_mux);
+}
+
+static void wtf_scan_reset_lock(void) {
+    taskENTER_CRITICAL(&scan_lock_mux);
+    channel_locked = false;
+    match_channel = 0;
+    match_count = 0;
+    match_first_ms = match_last_ms = 0;
+    lock_cooldown_until_ms = 0;
+    taskEXIT_CRITICAL(&scan_lock_mux);
+}
+
+static bool wtf_profile_ack_on(int64_t t) {
+    const int64_t start = __atomic_load_n(&profile_ack_start_ms, __ATOMIC_RELAXED);
+    const unsigned profile = __atomic_load_n(&profile_ack_value, __ATOMIC_RELAXED);
+    if (!profile || t < start) return false;
+    const int64_t elapsed = t - start;
+    const int64_t base = 10 * 240;
+    if (elapsed < base) return (elapsed % 240) < 120;
+    if (elapsed < base + 300) return false;
+    const int64_t rest = elapsed - base - 300;
+    return rest < (int64_t)profile * 240 && (rest % 240) < 120;
+}
+
+static bool wtf_profile_ack_active(int64_t t) {
+    const int64_t start = __atomic_load_n(&profile_ack_start_ms, __ATOMIC_RELAXED);
+    const unsigned profile = __atomic_load_n(&profile_ack_value, __ATOMIC_RELAXED);
+    return profile >= 1 && profile <= 3 && t >= start &&
+           t - start < (int64_t)(10 + profile)*240 + 300;
+}
+
 static bool pattern_on(int64_t elapsed, const int *dur, int n) {
     for(int i=0;i<n;i++) { if(elapsed < dur[i]) return (i%2)==0; elapsed-=dur[i]; }
     return false;
@@ -283,6 +365,8 @@ static void indicator_task(void *arg) {
             beep=on && WTF_BUZZER_ON_FAULT;
         } else if (t<boot_until_ms) {
             int d[]={u,u,u,u,u}; on=pattern_on(t-(boot_until_ms-5*u),d,5);
+        } else if (!diagnostic_mode && wtf_profile_ack_active(t)) {
+            on=wtf_profile_ack_on(t);
         } else if (t<selftest_until_ms) {
             int d[]={u,u,u}; on=pattern_on(t%WTF_SELFTEST_INTERVAL_MS,d,3);
         } else if (t<alert_until_ms) {
@@ -624,6 +708,18 @@ static void wifi_sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
             // Debug logging to verify WIFI Scanning
             ESP_LOGD(TAG, "WiFi SSID Seen: %s", ssid);
 
+#if WTF_ACCEPT_LAB_BEACONS
+            // Only enabled for a development detector. A test beacon exercises
+            // real Wi-Fi reception, scan locking and RSSI, but is NOT logged as
+            // a genuine target detection and does not touch SPIFFS.
+            if (has_mac && strcmp(ssid, "WTF-LAB-01") == 0) {
+                wtf_scan_note_match(src_mac, pkt->rx_ctrl.channel, 2);
+                wtf_update_rssi(1,src_mac,pkt->rx_ctrl.rssi);
+                if (unique_transmitter(1,src_mac))
+                    ESP_LOGI(TAG,"LAB beacon accepted on channel %u",pkt->rx_ctrl.channel);
+            }
+#endif
+
             for (int i = 0; i < sizeof(wifi_ssid_patterns)/sizeof(char*); i++) {
                 if (strstr(ssid, wifi_ssid_patterns[i]) != NULL) {
                     ESP_LOGI(TAG, "WIFI SSID MATCH: %s", ssid);
@@ -639,7 +735,10 @@ static void wifi_sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
 
                     ESP_LOGW("DETECTION", ">>> %s <<<", log_buf);
 
-                    if(has_mac) observe_detection(1,src_mac,pkt->rx_ctrl.rssi,log_buf);
+                    if(has_mac) {
+                        wtf_scan_note_match(src_mac, pkt->rx_ctrl.channel, 2);
+                        observe_detection(1,src_mac,pkt->rx_ctrl.rssi,log_buf);
+                    }
                 }
             }
         }
@@ -664,6 +763,7 @@ static void wifi_sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
 
             ESP_LOGW("DETECTION", ">>> %s <<<", log_buf);
 
+            wtf_scan_note_match(src_mac, pkt->rx_ctrl.channel, 1);
             observe_detection(1,src_mac,pkt->rx_ctrl.rssi,log_buf);
         }
     }
@@ -727,37 +827,128 @@ static void ble_init_monitor(void) {
     nimble_port_freertos_init(ble_host_task);
 }
 
-static void channel_hop_task(void *arg)
-{
-    ESP_LOGI(TAG, "Channel hop task running on core %d", xPortGetCoreID());
-    uint8_t channel = 1;
-    unsigned consecutive_errors = 0;
-    bool reported_error = false;
-    // NimBLE initializes asynchronously. Catch a missing sync in normal mode too.
-    const int64_t ble_sync_deadline = now_ms() + 7000;
-    bool ble_sync_checked = false;
+// NVS holds the last user-selected profile across power loss and resets.
+static void wtf_profile_load(void) {
+    nvs_handle_t h;
+    esp_err_t err = nvs_open("wtf", NVS_READONLY, &h);
+    if (err != ESP_OK) {
+        if (err != ESP_ERR_NVS_NOT_FOUND) wtf_report_fault(WTF_F_NVS,WTF_DEGRADED,err);
+        selected_scan_profile = WTF_SCAN_P2_BALANCED;
+        return;
+    }
+    uint8_t saved = WTF_SCAN_P2_BALANCED;
+    err = nvs_get_u8(h,"scan_profile", &saved);
+    nvs_close(h);
+    if (err == ESP_OK && saved >= 1 && saved <= 3) selected_scan_profile = saved;
+    else selected_scan_profile = WTF_SCAN_P2_BALANCED;
+}
 
+static void wtf_profile_save(uint8_t profile) {
+    nvs_handle_t h;
+    esp_err_t err = nvs_open("wtf",NVS_READWRITE,&h);
+    if (err == ESP_OK) {
+        err = nvs_set_u8(h,"scan_profile",profile);
+        if (err == ESP_OK) err = nvs_commit(h);
+        nvs_close(h);
+    }
+    if (err != ESP_OK) wtf_report_fault(WTF_F_NVS,WTF_DEGRADED,err);
+}
+
+static void wtf_profile_button_task(void *arg) {
+    (void)arg;
+    int stable = 1, previous_sample = 1;
+    int64_t changed_at = now_ms();
     while (1) {
-        if (!ble_sync_checked && now_ms() >= ble_sync_deadline) {
-            ble_sync_checked = true;
-            if (!ble_ready && ble_enabled && !fault_latched)
-                wtf_report_fault(WTF_F_BLE, WTF_FATAL, -2);
-        }
-        if (wifi_enabled && wifi_ready) {
-            esp_err_t err = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
-            if (err != ESP_OK) {
-                if (++consecutive_errors >= 3 && !reported_error) {
-                    wtf_report_fault(WTF_F_WIFI_HOP,WTF_DEGRADED,err);
-                    reported_error = true;
-                }
-            } else {
-                consecutive_errors = 0;
-                reported_error = false;
+        const int sample = gpio_get_level((gpio_num_t)WTF_PROFILE_BUTTON_GPIO);
+        const int64_t t=now_ms();
+        if (sample != previous_sample) { previous_sample = sample; changed_at=t; }
+        if (sample != stable && t - changed_at >= 45) {
+            stable=sample;
+            if (stable==0 && !diagnostic_mode) {
+                uint8_t next=(uint8_t)(selected_scan_profile % 3 + 1);
+                __atomic_store_n(&selected_scan_profile,next,__ATOMIC_RELAXED);
+                wtf_scan_reset_lock();
+                wtf_profile_save(next); // task context, never the RF callback
+                __atomic_store_n(&profile_ack_value,next,__ATOMIC_RELAXED);
+                __atomic_store_n(&profile_ack_start_ms,now_ms(),__ATOMIC_RELAXED);
+                ESP_LOGI(TAG,"Scan profile P%u selected", (unsigned)next);
             }
         }
-        channel = (channel % 13) + 1;
-        ESP_LOGD(TAG, ">> CHANNEL: %d <<", channel);
-        vTaskDelay(pdMS_TO_TICKS(500));
+        vTaskDelay(pdMS_TO_TICKS(15));
+    }
+}
+
+static void wtf_profile_button_init(void) {
+    const gpio_config_t cfg = {
+        .pin_bit_mask=(1ULL << WTF_PROFILE_BUTTON_GPIO),
+        .mode=GPIO_MODE_INPUT,
+        .pull_up_en=GPIO_PULLUP_ENABLE,
+        .pull_down_en=GPIO_PULLDOWN_DISABLE,
+        .intr_type=GPIO_INTR_DISABLE
+    };
+    esp_err_t err=gpio_config(&cfg);
+    if(err != ESP_OK) {wtf_report_fault(WTF_F_GPIO,WTF_DEGRADED,err);return;}
+    if(xTaskCreate(wtf_profile_button_task,"profile_button",2048,NULL,2,NULL)!=pdPASS)
+        wtf_report_fault(WTF_F_TASK,WTF_DEGRADED,6);
+}
+
+static void channel_hop_task(void *arg) {
+    (void)arg;
+    ESP_LOGI(TAG,"Adaptive channel scheduler started");
+    unsigned consecutive_errors=0;
+    bool reported_error=false;
+    const int64_t ble_sync_deadline=now_ms()+7000;
+    bool ble_sync_checked=false;
+    uint32_t step=0;
+    uint8_t last_profile=0, previous_channel=0;
+    int64_t next_hop_ms=0;
+    while (1) {
+        const int64_t t=now_ms();
+        if (!ble_sync_checked && t >= ble_sync_deadline) {
+            ble_sync_checked=true;
+            if (!ble_ready && ble_enabled && !fault_latched)
+                wtf_report_fault(WTF_F_BLE,WTF_FATAL,-2);
+        }
+        const uint8_t profile=__atomic_load_n(&selected_scan_profile,__ATOMIC_RELAXED);
+        if (profile != last_profile) {
+            last_profile=profile;
+            step=0;
+            next_hop_ms=0;
+            previous_channel=0;
+        }
+        if (wifi_enabled && wifi_ready && t >= next_hop_ms) {
+            uint8_t channel=0;
+            bool locked=false;
+            taskENTER_CRITICAL(&scan_lock_mux);
+            if (channel_locked && !wtf_scan_lock_valid(t,match_last_ms,channel_lock_started_ms)) {
+                channel_locked=false;
+                lock_cooldown_until_ms=t+WTF_SCAN_LOCK_COOLDOWN_MS;
+                match_count=0;
+                ++channel_unlock_count;
+            }
+            if (channel_locked) {
+                locked=true;
+                channel=match_channel;
+            }
+            taskEXIT_CRITICAL(&scan_lock_mux);
+            if (!locked) channel=wtf_scan_next_channel(profile,step++);
+            if (channel != previous_channel) {
+                const esp_err_t err=esp_wifi_set_channel(channel,WIFI_SECOND_CHAN_NONE);
+                if (err != ESP_OK) {
+                    if (++consecutive_errors >= 3 && !reported_error) {
+                        wtf_report_fault(WTF_F_WIFI_HOP,WTF_DEGRADED,err);
+                        reported_error=true;
+                    }
+                } else {
+                    consecutive_errors=0;
+                    reported_error=false;
+                    previous_channel=channel;
+                    __atomic_store_n(&active_wifi_channel,channel,__ATOMIC_RELAXED);
+                }
+            }
+            next_hop_ms=t+(locked ? 60 : wtf_scan_dwell_ms(profile,channel));
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
@@ -765,7 +956,7 @@ static void channel_hop_task(void *arg)
 static void console_task(void *arg) {
     (void)arg;
     char line[128];
-    printf("\nWTF v0.1.3 | type help\n"); fflush(stdout);
+    printf("\nWTF v0.1.4 | type help\n"); fflush(stdout);
     while(1) {
         printf("wtf> "); fflush(stdout);
         if(!fgets(line,sizeof(line),stdin)) {clearerr(stdin);vTaskDelay(pdMS_TO_TICKS(150));continue;}
@@ -775,16 +966,19 @@ static void console_task(void *arg) {
             puts("wifi on/off | ble on/off | test selftest | test sos | test fault");
             puts("test detect <rssi> | test rssi <rssi> | test clear");
         } else if(!strcmp(line,"version")) {
-            printf("WTF v0.1.3 / %s %s\n",__DATE__,__TIME__);
+            printf("WTF v0.1.4 / %s %s\n",__DATE__,__TIME__);
         } else if(!strcmp(line,"status")) {
             int64_t t=now_ms();
-            printf("uptime=%lldms mode=%s wifi=%s ble=%s spiffs=%s fatal=%d fatal_code=F%02u last_code=F%02u detail=%d events=%u rssi=%d detections=%u wifi_rx=%" PRIu32 " ble_rx=%" PRIu32 " trend_votes=%d speed=%d\n",
+            printf("uptime=%lldms mode=%s wifi=%s ble=%s spiffs=%s fatal=%d fatal_code=F%02u last_code=F%02u detail=%d events=%u rssi=%d detections=%u wifi_rx=%" PRIu32 " ble_rx=%" PRIu32 " trend_votes=%d speed=%d profile=P%u channel=%u locks=%" PRIu32 " matches=%" PRIu32 "\n",
                 (long long)t,diagnostic_mode?"diagnostic":"normal",
                 wifi_enabled?"on":"off",ble_enabled?"on":"off",spiffs_ready?"ok":"unavailable",
                 fault_latched,(unsigned)fatal_fault_code,(unsigned)last_fault_code,
                 last_fault_detail,fault_events,last_rssi,detection_count,
                 __atomic_load_n(&wifi_rx_packets,__ATOMIC_RELAXED),
-                __atomic_load_n(&ble_rx_adverts,__ATOMIC_RELAXED),trend_score,WTF_ANIMATION_SPEED);
+                __atomic_load_n(&ble_rx_adverts,__ATOMIC_RELAXED),trend_score,WTF_ANIMATION_SPEED,
+                (unsigned)selected_scan_profile,(unsigned)active_wifi_channel,
+                __atomic_load_n(&channel_lock_count,__ATOMIC_RELAXED),
+                __atomic_load_n(&matched_wifi_packets,__ATOMIC_RELAXED));
         } else if(!strcmp(line,"reset reason")) {
             printf("reset_reason=%d (ESP-IDF esp_reset_reason enum)\n",esp_reset_reason());
         } else if(!strcmp(line,"reset")) {
@@ -998,7 +1192,15 @@ void app_main(void) {
 
     esp_err_t ret = nvs_flash_init();
     if (ret != ESP_OK) wtf_report_fault(WTF_F_NVS,WTF_FATAL,ret);
-    if (!fault_latched) init_spiffs();
+    if (!fault_latched) {
+        wtf_profile_load();
+        if (!diagnostic_mode) {
+            __atomic_store_n(&profile_ack_value,selected_scan_profile,__ATOMIC_RELAXED);
+            __atomic_store_n(&profile_ack_start_ms,boot_until_ms,__ATOMIC_RELAXED);
+        }
+        wtf_profile_button_init();
+        init_spiffs();
+    }
     // Headless by default: SPIFFS history is retained, not dumped on boot.
     log_queue = xQueueCreate(32,180);
     if (log_queue) {
@@ -1022,6 +1224,6 @@ void app_main(void) {
         if (xTaskCreate(wtf_diagnostic_task,"diagnostic",4096,NULL,3,NULL) != pdPASS)
             wtf_report_fault(WTF_F_TASK,WTF_FATAL,5);
     }
-    ESP_LOGI(TAG,"v0.1.3 ready; boot_mode=%s LED_GPIO=%d speed=%d",
+    ESP_LOGI(TAG,"v0.1.4 ready; boot_mode=%s LED_GPIO=%d speed=%d",
              diagnostic_mode?"diagnostic":"normal",USER_LED_GPIO,WTF_ANIMATION_SPEED);
 }
