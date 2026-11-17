@@ -181,6 +181,18 @@ Main configuration values are in [`main/wtf_config.h`](main/wtf_config.h). In pa
 - [ ] Improve headless fault-code identification beyond a common SOS indication.
 - [ ] Expand support and hardware validation for additional ESP32 boards, where feasible.
 
-## Attribution
+## Credits & Attribution
 
-This fork builds on [spuder/What-The-Flock](https://github.com/spuder/What-The-Flock), which credits the original *Flock You* project. Existing upstream code and signature lists remain subject to their original authors' rights and any applicable license terms; **verify upstream licensing before redistributing beyond the terms allowed**. This project is intended for legitimate research and educational use. Comply with local laws and respect the privacy of others.
+**What-The-Flock** was originally developed by [WhatIsInCreedmoor](https://github.com/WhatIsInCreedmoor/What-The-Flock) as an ESP-IDF implementation of the [Flock You](https://github.com/colonelpanichacks/flock-you) surveillance-device detection project.
+
+This fork builds upon that original implementation, with additional development focused on the Seeed Studio XIAO ESP32-C5, adaptive Wi-Fi channel scanning, RSSI-based indications, persistent configurations, headless diagnostics, and hardware testing.
+
+**Original projects and research:**
+
+- [WhatIsInCreedmoor/What-The-Flock](https://github.com/WhatIsInCreedmoor/What-The-Flock) — original ESP-IDF implementation (deprecated).
+- [colonelpanichacks/flock-you](https://github.com/colonelpanichacks/flock-you) — preceding Flock You firmware and detection research.
+- [NitekryDPaul](https://github.com/NitekryDPaul) — Wi-Fi OUI detection research acknowledged by Flock You.
+
+This repository was forked through an intermediate third-party GitHub repository. Its development history is preserved in Git.
+
+All original contributions remain credited to their respective authors. This fork is independently maintained and is not affiliated with Flock Safety.
