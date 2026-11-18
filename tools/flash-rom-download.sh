@@ -19,7 +19,7 @@ cd "$ROOT"
 cat <<'NOTICE'
 This uses the ROM downloader (not the crashing application USB console).
 BEFORE continuing: hold BOOT, tap RESET, release BOOT on the XIAO C5.
-No flash erase and NO SPIFFS write/format will be performed.
+The flashing command does not erase the SPIFFS partition. On first application boot, firmware WILL format storage if and ONLY if the entire partition is erased (all 0xFF).
 NOTICE
 read -r -p "Board is in BOOT/download mode? Press Enter (Ctrl+C cancels): " _
 python -m esptool --chip esp32c5 -p "$PORT" -b 115200 \
