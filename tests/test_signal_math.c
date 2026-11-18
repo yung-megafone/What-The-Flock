@@ -14,6 +14,12 @@ int main(void) {
     assert(wtf_rssi_interval_ms(-46)==125);
     assert(wtf_rssi_interval_ms(-45)==0);
     assert(wtf_rssi_interval_ms(-25)==0);
+    assert(wtf_led_display_rssi(-70,-45)==-70);
+    assert(wtf_led_display_rssi(-95,-70)==-95);
+    assert(wtf_led_display_rssi(-85,-70)==-75);
+    assert(wtf_led_display_rssi(-70,-70)==-45);
+    assert(wtf_led_display_rssi(-60,-70)==-45);
+    assert(wtf_rssi_interval_ms(wtf_led_display_rssi(-70,-70))==0);
     int distinct = 0;
     for (int d=-95; d < -45; ++d) {
         const int a=wtf_rssi_interval_ms(d), b=wtf_rssi_interval_ms(d+1);
