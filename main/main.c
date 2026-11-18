@@ -31,6 +31,7 @@
 
 // SPIFFS
 #include "esp_spiffs.h"
+#include "esp_partition.h"
 #include "esp_timer.h"
 
 // Hardware Definitions - Conditional on Target Chip
@@ -139,6 +140,27 @@ static uint8_t recent_macs[24][7]; // [radio kind, 6 MAC bytes]
 static int64_t recent_times[24];
 static unsigned recent_next = 0;
 static unsigned detection_count = 0;
+
+// Field telemetry. RAM-only until an encounter closes, minimizing flash writes.
+// Uptime milliseconds are NOT absolute timestamps; no RTC/GPS is present.
+#define WTF_ENCOUNTER_SLOTS 24
+#define WTF_ENCOUNTER_IDLE_MS 3000
+#define WTF_ENCOUNTER_MIN_AGE_MS 100
+#define WTF_ENCOUNTER_TICK_MS 500
+typedef struct {
+    bool active;
+    uint8_t kind;
+    uint8_t mac[6];
+    int first_rssi;
+    int peak_rssi;
+    int last_rssi;
+    uint32_t samples;
+    int64_t started_ms;
+    int64_t last_ms;
+} wtf_encounter_t;
+static wtf_encounter_t encounters[WTF_ENCOUNTER_SLOTS];
+static portMUX_TYPE encounter_lock = portMUX_INITIALIZER_UNLOCKED;
+static volatile uint32_t encounter_overflow_count = 0;
 static int64_t now_ms(void) { return esp_timer_get_time()/1000; }
 
 // Safe for use from FreeRTOS tasks and radio callbacks (not from ISRs).
@@ -261,9 +283,73 @@ static bool unique_transmitter(int kind, const uint8_t mac[6]) {
     taskEXIT_CRITICAL(&detection_lock);
     return fresh;
 }
+// Called only after a configured signature matches, or for explicitly
+// enabled WTF-LAB-01 frames with kind=3. No RF callback writes SPIFFS.
+// A short critical section keeps Wi-Fi/BLE callbacks nonblocking.
+static void wtf_note_encounter(int kind, const uint8_t mac[6], int rssi) {
+    const int64_t t = now_ms();
+    taskENTER_CRITICAL(&encounter_lock);
+    int slot = -1, free_slot = -1;
+    for (int i=0; i<WTF_ENCOUNTER_SLOTS; ++i) {
+        if (encounters[i].active && encounters[i].kind == kind &&
+            memcmp(encounters[i].mac, mac, 6) == 0) { slot = i; break; }
+        if (!encounters[i].active && free_slot == -1) free_slot = i;
+    }
+    if (slot < 0) slot = free_slot;
+    if (slot >= 0) {
+        wtf_encounter_t *e = &encounters[slot];
+        if (!e->active) {
+            *e = (wtf_encounter_t){.active=true, .kind=(uint8_t)kind,
+                .first_rssi=rssi, .peak_rssi=rssi, .last_rssi=rssi,
+                .samples=0, .started_ms=t};
+            memcpy(e->mac, mac, 6);
+        }
+        if (rssi > e->peak_rssi) e->peak_rssi = rssi;
+        e->last_rssi = rssi;
+        e->last_ms = t;
+        if (e->samples != UINT32_MAX) ++e->samples;
+    } else {
+        ++encounter_overflow_count;
+    }
+    taskEXIT_CRITICAL(&encounter_lock);
+}
+
+// Flush only closed encounters. A matching MAC seen again within 3 seconds
+// stays in the same encounter; this is not an RF packet capture/PCAP.
+static void wtf_encounter_flush_task(void *arg) {
+    (void)arg;
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(WTF_ENCOUNTER_TICK_MS));
+        const int64_t t = now_ms();
+        for (int i=0; i<WTF_ENCOUNTER_SLOTS; ++i) {
+            wtf_encounter_t snapshot = {0};
+            taskENTER_CRITICAL(&encounter_lock);
+            if (encounters[i].active && t - encounters[i].last_ms >= WTF_ENCOUNTER_IDLE_MS &&
+                t - encounters[i].started_ms >= WTF_ENCOUNTER_MIN_AGE_MS) {
+                snapshot = encounters[i];
+                encounters[i].active = false;
+            }
+            taskEXIT_CRITICAL(&encounter_lock);
+            if (!snapshot.active) continue;
+            char record[180];
+            snprintf(record, sizeof(record),
+                "[ENCOUNTER %s] uptime_ms=%" PRId64 "..%" PRId64
+                " MAC=%02X:%02X:%02X:%02X:%02X:%02X first=%d peak=%d last=%d samples=%" PRIu32,
+                snapshot.kind == 1 ? "WIFI" : (snapshot.kind == 3 ? "LAB WIFI" : "BLE"),
+                snapshot.started_ms, snapshot.last_ms,
+                snapshot.mac[0],snapshot.mac[1],snapshot.mac[2],
+                snapshot.mac[3],snapshot.mac[4],snapshot.mac[5],
+                snapshot.first_rssi,snapshot.peak_rssi,snapshot.last_rssi,snapshot.samples);
+            if (log_queue && xQueueSend(log_queue,record,0)!=pdTRUE)
+                wtf_report_fault(WTF_F_LOG_QUEUE_FULL,WTF_DEGRADED,1);
+        }
+    }
+}
+
 static void observe_detection(int kind, const uint8_t mac[6], int rssi, const char *line) {
     if (diagnostic_mode) return; // test mode never creates real detection records
     wtf_update_rssi(kind, mac, rssi);
+    wtf_note_encounter(kind, mac, rssi);
     if (unique_transmitter(kind,mac)) {
         ESP_LOGW("DETECTION", "%s",line);
         if (log_queue) {
@@ -403,7 +489,8 @@ static void indicator_task(void *arg) {
                     display_q8 = display_q8-drop > floor_q8 ? display_q8-drop : floor_q8;
                 }
                 const int shown = (int)(display_q8 / 256);
-                const int interval=wtf_rssi_interval_ms(shown);
+                const int interval=wtf_rssi_interval_ms(
+                    wtf_led_display_rssi(shown, WTF_LED_PEAK_RSSI_DBM));
                 if (interval == 0) {
                     on=true; // solid = strong RSSI, NOT a distance guarantee
                 } else {
@@ -457,14 +544,32 @@ static void dump_logs_to_console(void) {
 }
 #endif
 
+// Format only an entirely erased storage partition on first boot.
+// Crucially, a corrupt/nonempty partition is NEVER automatically formatted.
+static bool wtf_storage_is_erased(void) {
+    const esp_partition_t *part = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, "storage");
+    if (!part) return false;
+    uint8_t bytes[256];
+    for (size_t offset=0; offset<part->size; offset+=sizeof(bytes)) {
+        size_t n=part->size-offset;
+        if (n>sizeof(bytes)) n=sizeof(bytes);
+        if (esp_partition_read(part, offset, bytes, n)!=ESP_OK) return false;
+        for (size_t i=0; i<n; ++i) if (bytes[i]!=0xff) return false;
+    }
+    return true;
+}
+
 static void init_spiffs(void) {
     ESP_LOGI(TAG, "Initializing SPIFFS");
 
+    const bool blank_storage = wtf_storage_is_erased();
+    if (blank_storage) ESP_LOGW(TAG,"Storage entirely erased: first-run SPIFFS initialization enabled");
     esp_vfs_spiffs_conf_t conf = {
       .base_path = "/spiffs",
       .partition_label = "storage",
       .max_files = 5,
-      .format_if_mount_failed = false
+      .format_if_mount_failed = blank_storage
     };
 
     esp_err_t ret = esp_vfs_spiffs_register(&conf);
@@ -481,6 +586,17 @@ static void init_spiffs(void) {
     }
 
     spiffs_ready = true;
+    // Validate actual file creation, not just the mount call.
+    FILE *probe = fopen("/spiffs/.wtf_rw_probe", "w");
+    bool write_ok = probe != NULL;
+    if (write_ok && fputs("ok",probe)==EOF) write_ok = false;
+    if (probe && fclose(probe)!=0) write_ok = false;
+    if (!write_ok) {
+        spiffs_ready = false;
+        wtf_report_fault(WTF_F_SPIFFS, WTF_DEGRADED, -10);
+        return;
+    }
+    remove("/spiffs/.wtf_rw_probe");
     size_t total = 0, used = 0;
     ret = esp_spiffs_info("storage", &total, &used);
     if (ret == ESP_OK) {
@@ -709,14 +825,33 @@ static void wifi_sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
             ESP_LOGD(TAG, "WiFi SSID Seen: %s", ssid);
 
 #if WTF_ACCEPT_LAB_BEACONS
-            // Only enabled for a development detector. A test beacon exercises
-            // real Wi-Fi reception, scan locking and RSSI, but is NOT logged as
-            // a genuine target detection and does not touch SPIFFS.
+            // Testbench beacons are opt-in. They use the same receiver,
+            // channel confidence, RSSI engine and LED alert as field matches.
+            // Logging is separately gated and always LAB-labeled.
             if (has_mac && strcmp(ssid, "WTF-LAB-01") == 0) {
                 wtf_scan_note_match(src_mac, pkt->rx_ctrl.channel, 2);
                 wtf_update_rssi(1,src_mac,pkt->rx_ctrl.rssi);
-                if (unique_transmitter(1,src_mac))
+#if WTF_LOG_LAB_ENCOUNTERS
+                // Kind 3 is a distinct LAB record namespace, so testbench
+                // encounters are never mislabeled as a camera detection.
+                wtf_note_encounter(3,src_mac,pkt->rx_ctrl.rssi);
+#endif
+                if (unique_transmitter(1,src_mac)) {
                     ESP_LOGI(TAG,"LAB beacon accepted on channel %u",pkt->rx_ctrl.channel);
+#if WTF_LOG_LAB_ENCOUNTERS
+                    char lab_record[180];
+                    snprintf(lab_record, sizeof(lab_record),
+                             "[LAB WIFI] uptime_ms=%" PRId64
+                             " MAC=%02X:%02X:%02X:%02X:%02X:%02X channel=%u RSSI=%d SSID=WTF-LAB-01",
+                             now_ms(), src_mac[0],src_mac[1],src_mac[2],
+                             src_mac[3],src_mac[4],src_mac[5],
+                             (unsigned)pkt->rx_ctrl.channel,(int)pkt->rx_ctrl.rssi);
+                    if (log_queue && xQueueSend(log_queue,lab_record,0)!=pdTRUE)
+                        wtf_report_fault(WTF_F_LOG_QUEUE_FULL,WTF_DEGRADED,3);
+#endif
+                }
+                // LAB traffic must not fall through to OUI/SSID camera rules.
+                return;
             }
 #endif
 
@@ -1206,6 +1341,8 @@ void app_main(void) {
     if (log_queue) {
         if (xTaskCreate(logger_task,"logger",4096,NULL,4,NULL) != pdPASS)
             wtf_report_fault(WTF_F_TASK,WTF_FATAL,2);
+        if (xTaskCreate(wtf_encounter_flush_task,"encounters",4096,NULL,3,NULL) != pdPASS)
+            wtf_report_fault(WTF_F_TASK,WTF_DEGRADED,6);
     } else {
         wtf_report_fault(WTF_F_LOGGING,WTF_FATAL,0);
     }
@@ -1224,6 +1361,6 @@ void app_main(void) {
         if (xTaskCreate(wtf_diagnostic_task,"diagnostic",4096,NULL,3,NULL) != pdPASS)
             wtf_report_fault(WTF_F_TASK,WTF_FATAL,5);
     }
-    ESP_LOGI(TAG,"v0.1.4 ready; boot_mode=%s LED_GPIO=%d speed=%d",
+    ESP_LOGI(TAG,"v0.1.4.1 lab ready; boot_mode=%s LED_GPIO=%d speed=%d",
              diagnostic_mode?"diagnostic":"normal",USER_LED_GPIO,WTF_ANIMATION_SPEED);
 }

@@ -24,6 +24,17 @@ static inline int wtf_rssi_interval_ms(int rssi) {
     return 0;
 }
 
+// Translate only the LED display scale. Actual packet RSSI is untouched.
+// A peak of -45 preserves the legacy curve exactly; e.g. peak -70 maps
+// (-95..-70) into the legacy (-95..-45) visual range.
+static inline int wtf_led_display_rssi(int measured, int peak_dbm) {
+    const int min_dbm=-95;
+    if (peak_dbm <= min_dbm) return measured;
+    if (measured <= min_dbm) return min_dbm;
+    if (measured >= peak_dbm) return -45;
+    return min_dbm + ((measured-min_dbm)*50)/(peak_dbm-min_dbm);
+}
+
 // Asymmetric smoothing: promptly accept a stronger measurement; blend a
 // weaker one 25% toward its new value. Fresh tracking starts at raw RSSI.
 static inline int wtf_filter_rssi(int previous, int sample, int fresh) {
