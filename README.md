@@ -196,16 +196,27 @@ The standalone companion project is included in `WTF-RF-Testbench/` **alongside*
 
 ## Roadmap / known issues
 
-- [ ] Hardware-build and validate the v0.1.4 adaptive scheduler and button/NVS functions.
-- [ ] Add reliable packet-level capture and timestamped lock metrics for lab benchmarking.
-- [ ] Add one-shot and runtime-adjustable TX power to the companion testbench.
+- [x] Hardware-build and validate the v0.1.4 adaptive scheduler and button/NVS functions.
+- [x] Add one-shot and runtime-adjustable TX power to the companion testbench.
 - [ ] Investigate USB-Serial/JTAG connection-triggered stalls and make the debug console safe.
 - [ ] Refine the aggressive transition between solid LED and very fast pulses at high RSSI.
 - [ ] Validate live signature detection against known, authorized test sources and assess false positives.
-- [ ] Add a safe, documented method for retrieving stored detections without relying on the unstable console.
+- [x] Add a safe, documented method for retrieving stored detections without relying on the unstable console.
 - [ ] Improve headless fault-code identification beyond a common SOS indication.
 - [ ] Expand support and hardware validation for additional ESP32 boards, where feasible.
 
-## Attribution
+## Credits & Attribution
 
-This fork builds on [spuder/What-The-Flock](https://github.com/spuder/What-The-Flock), which credits the original *Flock You* project. Existing upstream code and signature lists remain subject to their original authors' rights and any applicable license terms; **verify upstream licensing before redistributing beyond the terms allowed**. This project is intended for legitimate research and educational use. Comply with local laws and respect the privacy of others.
+**What-The-Flock** was originally developed by [WhatIsInCreedmoor](https://github.com/WhatIsInCreedmoor/What-The-Flock) as an ESP-IDF implementation of the [Flock You](https://github.com/colonelpanichacks/flock-you) surveillance-device detection project.
+
+This fork builds upon that original implementation, with additional development focused on the Seeed Studio XIAO ESP32-C5, adaptive Wi-Fi channel scanning, RSSI-based indications, persistent configurations, headless diagnostics, and hardware testing.
+
+**Original projects and research:**
+
+- [WhatIsInCreedmoor/What-The-Flock](https://github.com/WhatIsInCreedmoor/What-The-Flock) — original ESP-IDF implementation (deprecated).
+- [colonelpanichacks/flock-you](https://github.com/colonelpanichacks/flock-you) — preceding Flock You firmware and detection research.
+- [NitekryDPaul](https://github.com/NitekryDPaul) — Wi-Fi OUI detection research acknowledged by Flock You.
+
+This repository was forked through an intermediate third-party GitHub repository. Its development history is preserved in Git.
+
+All original contributions remain credited to their respective authors. This fork is independently maintained and is not affiliated with Flock Safety.
