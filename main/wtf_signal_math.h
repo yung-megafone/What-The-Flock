@@ -72,3 +72,17 @@ static inline int wtf_strength_led_on(uint32_t phase, int interval_ms,
     return receding && interval_ms > second_start+second_width+45 &&
            elapsed_ms >= second_start && elapsed_ms < second_start+second_width;
 }
+
+// Active-buzzer cadence follows the LED display scale, with a minimum OFF
+// interval at full-strength. A zero LED interval means a fast chirp, NOT DC.
+static inline int wtf_buzzer_interval_ms(int led_interval_ms, int fastest_ms) {
+    return led_interval_ms < fastest_ms ? fastest_ms : led_interval_ms;
+}
+
+static inline int wtf_buzzer_chirp_on(uint32_t phase_q16, int interval_ms,
+                                     int chirp_ms) {
+    if (interval_ms <= 0 || chirp_ms <= 0) return 0;
+    const int elapsed = (int)(((uint64_t)(phase_q16 & 0xffffu) *
+                               (uint32_t)interval_ms) >> 16);
+    return elapsed < chirp_ms;
+}
