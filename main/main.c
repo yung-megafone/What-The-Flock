@@ -9,6 +9,9 @@
 #include "wtf_config.h"
 #include "wtf_signal_math.h"
 #include "wtf_scan_math.h"
+#if CONFIG_IDF_TARGET_ESP32C5 && WTF_ENABLE_LCD
+#include "wtf_lcd.h"
+#endif
 #include <string.h>
 
 #include "esp_event.h"
@@ -147,6 +150,7 @@ static QueueHandle_t log_queue;
 static portMUX_TYPE detection_lock = portMUX_INITIALIZER_UNLOCKED;
 static int last_rssi = -127;     // filtered value for the selected transmitter
 static int64_t last_seen_ms = 0;
+static const char *tracked_label = NULL;
 static int tracked_kind = 0;   // 1=Wi-Fi, 2=BLE, 3=synthetic test
 static uint8_t tracked_mac[6];
 static int last_raw_rssi = -127;
@@ -285,6 +289,7 @@ static void wtf_reset_rssi_tracking(void) {
     taskENTER_CRITICAL(&detection_lock);
     last_rssi = -127;
     last_seen_ms = 0;
+    tracked_label = NULL;
     tracked_kind = 0;
     memset(tracked_mac, 0, sizeof(tracked_mac));
     last_raw_rssi = -127;
@@ -294,7 +299,8 @@ static void wtf_reset_rssi_tracking(void) {
     taskEXIT_CRITICAL(&detection_lock);
 }
 
-static void wtf_update_rssi(int kind, const uint8_t mac[6], int rssi) {
+// Labels must point to static storage so the display can read a copied snapshot.
+static void wtf_update_rssi(int kind, const uint8_t mac[6], int rssi, const char *label) {
     const int64_t t = now_ms();
     if (rssi < -127 || rssi > 20 || mac == NULL) return;
     taskENTER_CRITICAL(&detection_lock);
@@ -315,6 +321,7 @@ static void wtf_update_rssi(int kind, const uint8_t mac[6], int rssi) {
         trend_score = wtf_trend_vote(trend_score, last_raw_rssi, rssi);
     }
     last_rssi = wtf_filter_rssi(last_rssi, rssi, fresh);
+    tracked_label = label;
     last_raw_rssi = rssi;
     if (fresh || rssi >= peak_rssi) {
         peak_rssi = rssi;
@@ -323,6 +330,19 @@ static void wtf_update_rssi(int kind, const uint8_t mac[6], int rssi) {
     last_seen_ms = t;
     taskEXIT_CRITICAL(&detection_lock);
 }
+
+#if CONFIG_IDF_TARGET_ESP32C5 && WTF_ENABLE_LCD
+wtf_lcd_sample_t wtf_lcd_get_sample(void) {
+    taskENTER_CRITICAL(&detection_lock);
+    const wtf_lcd_sample_t sample = {
+        .label = tracked_label,
+        .rssi = last_rssi,
+        .seen_ms = last_seen_ms,
+    };
+    taskEXIT_CRITICAL(&detection_lock);
+    return sample;
+}
+#endif
 
 // One animation-speed control. Fixed heartbeat periods are NOT scaled.
 #define ANIM_UNIT_MS (70 + ((WTF_ANIMATION_SPEED - 1) * 130 / 9))
@@ -414,9 +434,10 @@ static void wtf_encounter_flush_task(void *arg) {
     }
 }
 
-static void observe_detection(int kind, const uint8_t mac[6], int rssi, const char *line) {
+static void observe_detection(int kind, const uint8_t mac[6], int rssi,
+                              const char *label, const char *line) {
     if (diagnostic_mode) return; // test mode never creates real detection records
-    wtf_update_rssi(kind, mac, rssi);
+    wtf_update_rssi(kind, mac, rssi, label);
     wtf_note_encounter(kind, mac, rssi);
     if (unique_transmitter(kind,mac)) {
         ESP_LOGW("DETECTION", "%s",line);
@@ -838,6 +859,7 @@ static int ble_monitor_event(struct ble_gap_event *event, void *arg) {
         bool is_target = false;
         char name[33] = {0};
         const char* match_type = "None";
+        const char *vendor_label = NULL;
 
         // Verbose Logging when any BLE is discovered.
         ESP_LOGV(TAG, "BLE Discovered: %02X:%02X:%02X:%02X:%02X:%02X | RSSI: %d",
@@ -852,6 +874,7 @@ static int ble_monitor_event(struct ble_gap_event *event, void *arg) {
                 ESP_LOGW(TAG, "MATCH: MAC Prefix (%s)", TARGET_VENDORS[i].label);
                 is_target = true;
                 match_type = TARGET_VENDORS[i].label;
+                vendor_label = TARGET_VENDORS[i].label;
             }
         }
 
@@ -903,7 +926,7 @@ static int ble_monitor_event(struct ble_gap_event *event, void *arg) {
 
             ESP_LOGW("DETECTION", ">>> %s <<<", log_buf);
             uint8_t id[6]; for(int i=0;i<6;i++) id[i]=event->disc.addr.val[5-i];
-            observe_detection(2,id,event->disc.rssi,log_buf);
+            observe_detection(2,id,event->disc.rssi,vendor_label ? vendor_label : "BLE",log_buf);
         }
     }
     return 0;
@@ -917,6 +940,7 @@ static void wifi_sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     const uint8_t *payload = pkt->payload;
     uint8_t src_mac[6];
     bool has_mac = extract_source_mac(payload, src_mac);
+    const mac_filter_t *match = has_mac ? get_mac_filter(src_mac) : NULL;
 
     // 1. SSID SEARCHING (Beacons and Probe Responses)
     if (type == WIFI_PKT_MGMT && (payload[0] == 0x80 || payload[0] == 0x50)) {
@@ -936,7 +960,7 @@ static void wifi_sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
             // Logging is separately gated and always LAB-labeled.
             if (has_mac && strcmp(ssid, "WTF-LAB-01") == 0) {
                 wtf_scan_note_match(src_mac, pkt->rx_ctrl.channel, 2);
-                wtf_update_rssi(1,src_mac,pkt->rx_ctrl.rssi);
+                wtf_update_rssi(1,src_mac,pkt->rx_ctrl.rssi,"Lab WiFi");
 #if WTF_LOG_LAB_ENCOUNTERS
                 // Kind 3 is a distinct LAB record namespace, so testbench
                 // encounters are never mislabeled as a camera detection.
@@ -978,7 +1002,8 @@ static void wifi_sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
 
                     if(has_mac) {
                         wtf_scan_note_match(src_mac, pkt->rx_ctrl.channel, 2);
-                        observe_detection(1,src_mac,pkt->rx_ctrl.rssi,log_buf);
+                        observe_detection(1,src_mac,pkt->rx_ctrl.rssi,
+                                          match ? match->label : "WiFi AP",log_buf);
                     }
                 }
             }
@@ -991,7 +1016,6 @@ static void wifi_sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
         ESP_LOGV(TAG, "WiFi Packet from: %02X:%02X:%02X:%02X:%02X:%02X", 
                  src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5]);
 
-        const mac_filter_t *match = get_mac_filter(src_mac);
         if (match != NULL) {
             // Prepare the detailed string for both Log and Flash
             char log_buf[160];
@@ -1005,7 +1029,7 @@ static void wifi_sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
             ESP_LOGW("DETECTION", ">>> %s <<<", log_buf);
 
             wtf_scan_note_match(src_mac, pkt->rx_ctrl.channel, 1);
-            observe_detection(1,src_mac,pkt->rx_ctrl.rssi,log_buf);
+            observe_detection(1,src_mac,pkt->rx_ctrl.rssi,match->label,log_buf);
         }
     }
 }
@@ -1263,7 +1287,7 @@ static void console_task(void *arg) {
             char *p=line+(detect?12:10),*end=NULL;long v=strtol(p,&end,10);
             if(p==end || *end || v<-127 || v>20) puts("Expected RSSI -127..20");
             else {static const uint8_t test_mac[6]={0x57,0x54,0x46,0,0,1};
-                wtf_update_rssi(3,test_mac,(int)v);
+                wtf_update_rssi(3,test_mac,(int)v,"Test");
                 if(detect){alert_until_ms=now_ms()+5*ANIM_UNIT_MS;puts("Synthetic new-detection event; not logged");}
                 else puts("Synthetic RSSI sample processed by live filter (expires in 5 seconds)");}
         } else if(*line) puts("Unknown command; type help");
@@ -1301,19 +1325,19 @@ static bool wtf_check_spiffs_rw(void) {
 static bool wtf_check_rssi_math(void) {
     static const uint8_t test_mac[6]={0x57,0x54,0x46,0,0,1};
     wtf_reset_rssi_tracking();
-    wtf_update_rssi(3,test_mac,-50);
-    wtf_update_rssi(3,test_mac,-90);
+    wtf_update_rssi(3,test_mac,-50,"Test");
+    wtf_update_rssi(3,test_mac,-90,"Test");
     taskENTER_CRITICAL(&detection_lock);
     int result = last_rssi;
     taskEXIT_CRITICAL(&detection_lock);
     if (result != -60) return false;
-    wtf_update_rssi(3,test_mac,-35);
+    wtf_update_rssi(3,test_mac,-35,"Test");
     taskENTER_CRITICAL(&detection_lock);
     result = last_rssi;
     last_seen_ms = now_ms() - WTF_TRACK_TIMEOUT_MS - 1;
     taskEXIT_CRITICAL(&detection_lock);
     if (result != -35) return false;
-    wtf_update_rssi(3,test_mac,-75);
+    wtf_update_rssi(3,test_mac,-75,"Test");
     taskENTER_CRITICAL(&detection_lock);
     result = last_rssi;
     taskEXIT_CRITICAL(&detection_lock);
@@ -1381,20 +1405,20 @@ static void wtf_diagnostic_task(void *arg) {
     wtf_reset_rssi_tracking();
     for (int dbm=-95; dbm <= -45 && !fault_latched; dbm+=5) {
         for (int n=0; n<8 && !fault_latched; ++n) {
-            wtf_update_rssi(3,test_mac,dbm);
+            wtf_update_rssi(3,test_mac,dbm,"Test");
             vTaskDelay(pdMS_TO_TICKS(250));
         }
     }
     // Maximum strength is a relative indication; hold solid for two seconds.
     for (int n=0; n<8 && !fault_latched; ++n) {
-        wtf_update_rssi(3,test_mac,-45);
+        wtf_update_rssi(3,test_mac,-45,"Test");
         vTaskDelay(pdMS_TO_TICKS(250));
     }
     // Deliberately weaken the SAME source so the receding double-tick
     // path runs before the final SOS. No synthetic entries are logged.
     for (int dbm=-50; dbm >= -95 && !fault_latched; dbm-=5) {
         for (int n=0; n<6 && !fault_latched; ++n) {
-            wtf_update_rssi(3,test_mac,dbm);
+            wtf_update_rssi(3,test_mac,dbm,"Test");
             vTaskDelay(pdMS_TO_TICKS(250));
         }
     }
@@ -1478,6 +1502,10 @@ void app_main(void) {
         if (xTaskCreate(wtf_diagnostic_task,"diagnostic",4096,NULL,3,NULL) != pdPASS)
             wtf_report_fault(WTF_F_TASK,WTF_FATAL,5);
     }
+#if CONFIG_IDF_TARGET_ESP32C5 && WTF_ENABLE_LCD
+    if (!wtf_lcd_start())
+        ESP_LOGW(TAG, "LCD task could not start");
+#endif
     ESP_LOGI(TAG,"v0.1.4.1 lab ready; boot_mode=%s status_LED_GPIO=%d speed=%d",
              diagnostic_mode?"diagnostic":"normal",USER_LED_GPIO,WTF_ANIMATION_SPEED);
 }
