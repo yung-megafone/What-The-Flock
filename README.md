@@ -4,7 +4,7 @@
 
 # What The Flock (WTF)
 
-**Headless Wi-Fi/Bluetooth LE signature monitoring for the Seeed Studio XIAO ESP32-C5.**
+**Wi-Fi/Bluetooth LE signature monitoring for the Seeed Studio XIAO ESP32-C5 with an optional character LCD.**
 
 What The Flock (WTF) is an experimental ESP-IDF firmware project that listens for selected wireless identifiers associated with Flock-style surveillance equipment and provides a visual, RSSI-based indication when a configured signature is observed. Potential detections can be recorded to on-board SPIFFS storage.
 
@@ -46,6 +46,18 @@ This revision is built directly on the supplied working v0.1.3 archive. **The v0
 | Host computer | Linux with ESP-IDF 5.5.x; tested development environment: Fedora |
 
 **Never connect D10 to 5 V.** The XIAO uses 3.3 V GPIO logic. The D10 jumper is read at boot; changing it while running does not change modes until reset.
+
+### Optional 16×2 LCD
+
+Use an HD44780-compatible LCD with the standard PCF8574 I²C backpack. Connect SDA to **D4 / GPIO23**, SCL to **D8 / GPIO8**, and GND to the XIAO ground. This leaves D5 available for the profile button.
+
+Connect LCD VCC to **3V3_OUT** if the module supports 3.3 V. A 5 V module can use USB VBUS for power with a bidirectional I²C level shifter on SDA and SCL. Use suitable pull-ups to the respective logic supplies, including any present on the backpack.
+
+The LCD defaults to 7-bit address `0x27`. Set `WTF_LCD_I2C_ADDR` if your backpack uses another address, such as `0x3F`. Set `WTF_ENABLE_LCD` to `0` for a build with no display task. Both settings are in `main/wtf_config.h`.
+
+The screen shows the tracked match, its filtered RSSI in dBm, and a bar. The bar defaults to empty at −95 dBm and full at −70 dBm. After five seconds of silence the screen returns to `Scanning...`. A separate task checks for changes about every 150 ms and updates only changed characters. If a transfer fails or the LCD is absent at startup, the display task retries every three seconds while the receiver and indicators continue operating.
+
+For a bench check, boot with the diagnostic jumper installed. During the existing RSSI sweep the LCD shows `Test` with the changing reading and bar. The reception LED and buzzer should continue their normal diagnostic patterns.
 
 Earlier upstream hardware targets include ESP32-C6, C3, and S3; **those boards are not verified against this fork's current ESP32-C5-focused configuration**. Do not assume that the GPIO assignments or diagnostics apply unchanged to them.
 
