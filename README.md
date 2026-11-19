@@ -1,6 +1,6 @@
 > **v0.1.4.1 LAB TELEMETRY BUILD:** Both lab-beacon acceptance and lab SPIFFS encounter logging are enabled. The LED full-scale threshold is provisionally −70 dBm; all recorded RSSI readings remain raw. Read [`RELEASE-NOTES-v0.1.4.1-preview.md`](RELEASE-NOTES-v0.1.4.1-preview.md) for details and field-only settings.
->
-> Adds first-boot SPIFFS creation (only if fully erased), writable-storage check, matching-transmitter encounter summaries with first/peak/last RSSI, and configurable LED full-scale via `WTF_LED_PEAK_RSSI_DBM`. This records matching-frame metadata, **not raw packets or PCAP**.
+
+> **v0.1.4.1 preview:** Adds first-boot SPIFFS creation (only if fully erased), writable-storage check, matching-transmitter encounter summaries with first/peak/last RSSI, and configurable LED full-scale via `WTF_LED_PEAK_RSSI_DBM`. This records matching-frame metadata, **not raw packets or PCAP**. No hardware/ESP-IDF build verification yet.
 
 # What The Flock (WTF)
 
@@ -20,7 +20,7 @@ This revision is built directly on the supplied working v0.1.3 archive. **The v0
 - **Conservative temporary lock:** A recognized Wi-Fi SSID signature can lock immediately, while an OUI-only match requires two observations of the same source on the same channel within 1.2 seconds. Locks expire after 1.8 seconds of silence or 4.5 seconds maximum, followed by a 500 ms reacquisition cooldown. These are initial experimental settings.
 - **Persistent profiles:** Press a normally-open button connecting D5/GPIO24 to GND to cycle P1 → P2 → P3 → P1. The selected profile is written to NVS and restored on reboot; default is P2. Press and release for each change; do not leave the jumper permanently grounded.
 - **LED acknowledgment:** At normal boot and each profile change the LED emits 10 short flashes, pauses 300 ms, then flashes the profile number (1–3). SOS retains highest priority. Acknowledgment temporarily supersedes other LED indications but does not stop RF scanning.
-- **Lab mode (this package):** `WTF_ACCEPT_LAB_BEACONS=1` and `WTF_LOG_LAB_ENCOUNTERS=1`. The `WTF-RF-Testbench` beacons are logged under distinct `[LAB WIFI]` and `[ENCOUNTER LAB WIFI]` labels, never as genuine camera detections.
+- **Lab mode (this package):** `WTF_ACCEPT_LAB_BEACONS=1` and `WTF_LOG_LAB_ENCOUNTERS=1`. The `WTF-RF-Testbench` beacons are logged under distinct `[LAB WIFI]` and `[ENCOUNTER LAB WIFI]` labels, never as genuine camera detections. Set both to `0` for a field-only release.
 
 ## Features
 
@@ -41,7 +41,7 @@ This revision is built directly on the supplied working v0.1.3 archive. **The v0
 | Diagnostic jumper | **D10 / GPIO10 → GND** before reset |
 | Profile button | **D5 / GPIO24 → GND** momentary switch; internal pull-up |
 | Diagnostic input when open | Internal pull-up selects normal operation |
-| Buzzer | Disabled by default (`WTF_ENABLE_BUZZER=0`) |
+| Active buzzer | **D2 / GPIO25**, output active-high, enabled by default (`WTF_ENABLE_BUZZER=1`) |
 | Radio | Integrated Wi-Fi and Bluetooth LE |
 | Host computer | Linux with ESP-IDF 5.5.x; tested development environment: Fedora |
 
