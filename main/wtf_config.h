@@ -38,6 +38,16 @@
 // Momentary button D5(GPIO24)->GND. Selects P1/P2/P3, persists in NVS.
 #define WTF_PROFILE_BUTTON_GPIO 24
 
+// Optional HD44780 16x2 LCD with the standard PCF8574 backpack pin mapping.
+// Use D8 for I2C clock so D5 remains available for profile selection.
+#define WTF_ENABLE_LCD 1
+#define WTF_LCD_SDA_GPIO 23 // D4
+#define WTF_LCD_SCL_GPIO 8  // D8
+#define WTF_LCD_I2C_ADDR 0x27 // 7-bit address, often 0x3F on PCF8574A backpacks
+#define WTF_LCD_REFRESH_MS 150
+#define WTF_LCD_BAR_MIN_DBM (-95)
+#define WTF_LCD_BAR_MAX_DBM (-70)
+
 // proximity display (these are NOT calibrated distances).
 // LED full-scale is independently configurable and does NOT modify raw RSSI,
 // scan locking, match confidence, NVS data or stored detection records.
