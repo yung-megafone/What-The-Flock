@@ -50,6 +50,14 @@ int main(void) {
     assert(phase > 0 && phase < 65536);
     uint32_t phase2=wtf_phase_advance_q16(phase,100,500);
     assert(phase2 > phase);  // interval change preserves fractional phase
+    assert(wtf_buzzer_interval_ms(3000,220)==3000);
+    assert(wtf_buzzer_interval_ms(0,220)==220);
+    assert(wtf_buzzer_interval_ms(125,220)==220);
+    assert(wtf_buzzer_interval_ms(565,220)==565);
+    assert(wtf_buzzer_chirp_on(0,220,60));
+    assert(wtf_buzzer_chirp_on((uint32_t)(50*65536/220),220,60));
+    assert(!wtf_buzzer_chirp_on((uint32_t)(100*65536/220),220,60));
+    assert(!wtf_buzzer_chirp_on((uint32_t)(200*65536/220),220,60));
     puts("PASS: 50 distinct RSSI intervals, filter, trend, LED duty, phase continuity");
     return 0;
     //   Is there a better way to test this? 
