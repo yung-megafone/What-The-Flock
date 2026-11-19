@@ -1,15 +1,33 @@
 #pragma once
 // XIAO ESP32-C5 prototype defaults. Verify onboard LED GPIO/polarity on hardware.
-#define WTF_LED_GPIO 27 // Onboard LED is GPIO27
-#define WTF_ENABLE_BUZZER 0 // Not hooked up for testing
-#define WTF_BUZZER_ON_DETECTION 1 // Beeo when a new device is detected; requires WTF_ENABLE_BUZZER=1
-#define WTF_BUZZER_ON_FAULT 1 // Beep when a fault is detected; requires WTF_ENABLE_BUZZER=1 (i forgot what sound this is supposed to make)
-#define WTF_ENABLE_DEBUG_CONSOLE 0 // DO NOT USE -- BROKEN, CAUSES CRASHES
+// Onboard GPIO27: heartbeat, boot/profile confirmations, and fault status.
+#define WTF_STATUS_LED_GPIO 27
+#define WTF_STATUS_LED_ACTIVE_LEVEL 0
+// External XIAO D3 / GPIO7: RF reception cadence and new detection alerts.
+#define WTF_RECEPTION_LED_GPIO 7
+#define WTF_RECEPTION_LED_ACTIVE_LEVEL 1
+// Independently adjustable outputs. External LED: D3 -> resistor -> LED -> GND.
+// Seeed XIAO C5 pins are 3.3 V logic; do not drive a bare LED without resistor.
+// XIAO ESP32-C5 D2 = GPIO25. Passive buzzer via an external transistor driver.
+// The LEDC peripheral generates the audible tone; the RSSI controls chirp cadence.
+// Do not attach a low-impedance speaker directly to a GPIO.
+#define WTF_ENABLE_BUZZER 1
+#define WTF_BUZZER_GPIO 25
+#define WTF_BUZZER_ACTIVE_LEVEL 1 // 1 = active-high transistor base drive
+#define WTF_BUZZER_TONE_HZ 2000 // audible pitch, independent of chirp cadence
+#define WTF_BUZZER_DUTY_PERCENT 50 // 1..99, PWM duty while sounding (whatever you do, do NOT google "Sounding")
+#define WTF_BUZZER_PWM_TIMER LEDC_TIMER_0
+#define WTF_BUZZER_PWM_CHANNEL LEDC_CHANNEL_0
+#define WTF_BUZZER_CHIRP_MS 60
+#define WTF_BUZZER_FASTEST_INTERVAL_MS 220
+#define WTF_BUZZER_ON_DETECTION 1
+#define WTF_BUZZER_ON_FAULT 1
+#define WTF_ENABLE_DEBUG_CONSOLE 0
 #define WTF_ANIMATION_SPEED 1 // 1 fast (70 ms), 10 slow (200 ms)
 #define WTF_SELFTEST_INTERVAL_MS 4000 // FIXED: not affected by speed
 #define WTF_SCANNING_INTERVAL_MS 5000 // FIXED: not affected by speed
-#define WTF_TRACK_TIMEOUT_MS 5000 // FIXED: not affected by speed
-#define WTF_UNIQUE_COOLDOWN_MS 30000 // FIXED: not affected by speed
+#define WTF_TRACK_TIMEOUT_MS 5000
+#define WTF_UNIQUE_COOLDOWN_MS 30000
 
 // Boot-only offline diagnostics: XIAO ESP32-C5 D10 is GPIO10.
 // Connect D10 -> GND BEFORE reset to enable; leave open for normal operation.
@@ -25,12 +43,9 @@
 // scan locking, match confidence, NVS data or stored detection records.
 // Provisional on-road display calibration: -70 dBm shows maximum LED
 // strength. Adjust after reviewing logged encounter peaks. This affects
-// ONLY the LED mapping, never the received/stored RSSI or matching logic.
+// ONLY the indicator mapping, never the received/stored RSSI or matching logic.
 // Restore (-45) for the legacy display scale.
-// Current value is a guess. -45 is the legacy threshold, but signal strength seems weaker in the field. (20261118)
-#define WTF_LED_PEAK_RSSI_DBM (-70) // Needs to be calibrated based on real encounters. 
-
-
+#define WTF_LED_PEAK_RSSI_DBM (-70)
 // Strongest normalized RSSI reaches solid LED; pulse speed is continuous.
 // Retain a strong peak briefly, then visibly decelerate when readings weaken.
 #define WTF_RSSI_PEAK_HOLD_MS 900
@@ -43,10 +58,10 @@
 
 // LAB BUILD: real OTA WTF-LAB-01 beacon reception for bench verification.
 // Set both flags to 0 before a field-only firmware release.
-#define WTF_ACCEPT_LAB_BEACONS 0 // (0=ignore, 1=accept) LAB beacons are not real devices; they are for bench testing only.
+#define WTF_ACCEPT_LAB_BEACONS 1
 // Records lab source metadata and encounter RSSI via the SAME SPIFFS queue.
 // Clear [LAB WIFI] labels prevent confusion with real device detections.
-#define WTF_LOG_LAB_ENCOUNTERS 0 // (0=ignore, 1=log) LAB encounters are not real devices; they are for bench testing only.
+#define WTF_LOG_LAB_ENCOUNTERS 1
 #if WTF_LOG_LAB_ENCOUNTERS && !WTF_ACCEPT_LAB_BEACONS
 #error "Lab encounter logging requires WTF_ACCEPT_LAB_BEACONS=1"
 #endif
