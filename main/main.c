@@ -22,6 +22,9 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "driver/gpio.h"
+#if WTF_ENABLE_BUZZER
+#include "driver/ledc.h"
+#endif
 
 // BLE Headers
 #include "nimble/nimble_port.h"
@@ -36,13 +39,17 @@
 
 // Hardware Definitions - Conditional on Target Chip
 #if CONFIG_IDF_TARGET_ESP32C5
-    #define USER_LED_GPIO WTF_LED_GPIO
+    #define USER_LED_GPIO WTF_STATUS_LED_GPIO
+    #define USER_RECEPTION_LED_GPIO WTF_RECEPTION_LED_GPIO
+    #define HAS_SEPARATE_RECEPTION_LED 1
+    #define USER_BUZZER_GPIO WTF_BUZZER_GPIO
     #define HAS_LED 1
     #define ENABLE_EXT_ANTENNA 0
 #elif CONFIG_IDF_TARGET_ESP32C6
     #define USER_LED_GPIO 15
     #define USER_BUZZER_GPIO 0
     #define HAS_LED 1
+    #define HAS_SEPARATE_RECEPTION_LED 0
 
     // External antenna setup for C6
     #define ENABLE_EXT_ANTENNA 1
@@ -53,11 +60,13 @@
     #define USER_LED_GPIO 21
     #define USER_BUZZER_GPIO 1
     #define HAS_LED 1
+    #define HAS_SEPARATE_RECEPTION_LED 0
     #define ENABLE_EXT_ANTENNA 0
 
 #elif CONFIG_IDF_TARGET_ESP32C3
     #define USER_BUZZER_GPIO 2
     #define HAS_LED 0
+    #define HAS_SEPARATE_RECEPTION_LED 0
     #define ENABLE_EXT_ANTENNA 0
 
 #else
@@ -65,10 +74,69 @@
 #endif
 
 // Common definitions
+#if CONFIG_IDF_TARGET_ESP32C5
+#define LED_ON  WTF_STATUS_LED_ACTIVE_LEVEL
+#define LED_OFF (1 - WTF_STATUS_LED_ACTIVE_LEVEL)
+#define RECEPTION_LED_ON WTF_RECEPTION_LED_ACTIVE_LEVEL
+#define RECEPTION_LED_OFF (1 - WTF_RECEPTION_LED_ACTIVE_LEVEL)
+#else
 #define LED_ON  0
 #define LED_OFF 1
-#define BUZZER_ON  1
-#define BUZZER_OFF 0
+#endif
+// PWM is disabled between chirps. Polarity is handled by LEDC output inversion.
+#if WTF_ENABLE_BUZZER
+#if WTF_BUZZER_TONE_HZ < 100 || WTF_BUZZER_TONE_HZ > 10000
+#error "WTF_BUZZER_TONE_HZ must be between 100 and 10000 Hz"
+#endif
+#if WTF_BUZZER_DUTY_PERCENT < 1 || WTF_BUZZER_DUTY_PERCENT > 99
+#error "WTF_BUZZER_DUTY_PERCENT must be 1..99"
+#endif
+#if WTF_BUZZER_ACTIVE_LEVEL != 0 && WTF_BUZZER_ACTIVE_LEVEL != 1
+#error "WTF_BUZZER_ACTIVE_LEVEL must be 0 or 1"
+#endif
+#define WTF_BUZZER_PWM_RESOLUTION LEDC_TIMER_10_BIT
+#define WTF_BUZZER_PWM_FULL_SCALE (1U << 10)
+static bool buzzer_pwm_ready = false;
+static esp_err_t wtf_buzzer_pwm_init(void) {
+    ledc_timer_config_t timer_cfg = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = WTF_BUZZER_PWM_RESOLUTION,
+        .timer_num = WTF_BUZZER_PWM_TIMER,
+        .freq_hz = WTF_BUZZER_TONE_HZ,
+        .clk_cfg = LEDC_AUTO_CLK,
+    };
+    esp_err_t err = ledc_timer_config(&timer_cfg);
+    if (err != ESP_OK) return err;
+    ledc_channel_config_t channel_cfg = {
+        .gpio_num = USER_BUZZER_GPIO,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = WTF_BUZZER_PWM_CHANNEL,
+        .intr_type = LEDC_INTR_DISABLE,
+        .timer_sel = WTF_BUZZER_PWM_TIMER,
+        .duty = 0,
+        .hpoint = 0,
+        .flags.output_invert = (WTF_BUZZER_ACTIVE_LEVEL == 0),
+    };
+    err = ledc_channel_config(&channel_cfg);
+    if (err != ESP_OK) return err;
+    buzzer_pwm_ready = true;
+    return ESP_OK;
+}
+static void wtf_buzzer_pwm_set(bool enabled) {
+    if (!buzzer_pwm_ready) return;
+    const uint32_t duty = enabled
+        ? (WTF_BUZZER_PWM_FULL_SCALE * WTF_BUZZER_DUTY_PERCENT / 100U) : 0U;
+    esp_err_t err = ledc_set_duty(LEDC_LOW_SPEED_MODE, WTF_BUZZER_PWM_CHANNEL, duty);
+    if (err == ESP_OK) {
+        err = ledc_update_duty(LEDC_LOW_SPEED_MODE, WTF_BUZZER_PWM_CHANNEL);
+    }
+    if (err != ESP_OK) {
+        // Disable further PWM writes. RF scanning and logging are unaffected.
+        buzzer_pwm_ready = false;
+        ESP_LOGE("WHAT_THE_FLOCK", "Buzzer PWM update failed: %s", esp_err_to_name(err));
+    }
+}
+#endif
 
 static const char *TAG = "WHAT_THE_FLOCK";
 
@@ -428,10 +496,11 @@ static bool pattern_on(int64_t elapsed, const int *dur, int n) {
 static void indicator_task(void *arg) {
     // Sole owner of indicator pins. Retain fractional pulse phase when RSSI
     // changes, so the flash cadence accelerates smoothly without phase jumps.
-    int prev_led=-1, prev_buzzer=-1;
+    int prev_led=-1, prev_reception_led=-1, prev_buzzer=-1;
     bool had_signal = false;
     int32_t display_q8 = -127 * 256;
     uint32_t pulse_phase_q16 = 0;
+    uint32_t buzzer_phase_q16 = 0;
     int64_t prior_tick = now_ms();
     while(1) {
         int64_t t=now_ms();
@@ -441,6 +510,8 @@ static void indicator_task(void *arg) {
         prior_tick=t;
         int u=ANIM_UNIT_MS;
         bool on=false, beep=false;
+        bool status_special=false;
+        bool reception_on=false;
         if (fault_latched || (sos_preview && t < preview_until_ms)) {
             // Morse SOS (unchanged from v0.1.2). Fatal faults always win.
             int d[18]; int n=0;
@@ -448,15 +519,20 @@ static void indicator_task(void *arg) {
             int64_t active=27*u;
             int64_t phase=t%(active+1000);
             on=pattern_on(phase,d,n);
+            status_special=true;
             beep=on && WTF_BUZZER_ON_FAULT;
         } else if (t<boot_until_ms) {
             int d[]={u,u,u,u,u}; on=pattern_on(t-(boot_until_ms-5*u),d,5);
+            status_special=true;
         } else if (!diagnostic_mode && wtf_profile_ack_active(t)) {
             on=wtf_profile_ack_on(t);
+            status_special=true;
         } else if (t<selftest_until_ms) {
             int d[]={u,u,u}; on=pattern_on(t%WTF_SELFTEST_INTERVAL_MS,d,3);
+            status_special=true;
         } else if (t<alert_until_ms) {
             int d[]={u,u,u,u,u}; on=pattern_on(t-(alert_until_ms-5*u),d,5);
+            reception_on=on;
             beep=on && WTF_BUZZER_ON_DETECTION;
         } else {
             int r=-127, peak=-127, votes=0;
@@ -479,6 +555,7 @@ static void indicator_task(void *arg) {
                 if (!had_signal) {
                     display_q8 = target * 256;
                     pulse_phase_q16 = 0;
+                    buzzer_phase_q16 = 0;
                     had_signal=true;
                 } else if (target * 256 > display_q8) {
                     display_q8=target * 256; // stronger: quick response
@@ -491,27 +568,56 @@ static void indicator_task(void *arg) {
                 const int shown = (int)(display_q8 / 256);
                 const int interval=wtf_rssi_interval_ms(
                     wtf_led_display_rssi(shown, WTF_LED_PEAK_RSSI_DBM));
+                // Chirp cadence mirrors the *display-scaled* RSSI, but is
+                // never continuous. A strong match still produces discrete
+                // 60ms chirps, at most one every 220ms. No beeps on idle.
+#if WTF_ENABLE_BUZZER
+                const int chirp_interval = wtf_buzzer_interval_ms(
+                    interval, WTF_BUZZER_FASTEST_INTERVAL_MS);
+                buzzer_phase_q16 = wtf_phase_advance_q16(
+                    buzzer_phase_q16, dt, chirp_interval);
+                beep = wtf_buzzer_chirp_on(buzzer_phase_q16,
+                                             chirp_interval, WTF_BUZZER_CHIRP_MS);
+#endif
                 if (interval == 0) {
-                    on=true; // solid = strong RSSI, NOT a distance guarantee
+                    reception_on=true; // solid = strong RSSI, NOT a distance guarantee
                 } else {
                     pulse_phase_q16 = wtf_phase_advance_q16(pulse_phase_q16,
                                                                  dt,interval);
                     // Two ticks when the selected MAC's RSSI has *measurably*
                     // weakened; packet silence alone does not assert recession.
-                    on = wtf_strength_led_on(pulse_phase_q16, interval, u,
+                    reception_on = wtf_strength_led_on(pulse_phase_q16, interval, u,
                           votes <= -2 && age < WTF_RSSI_TREND_STALE_MS);
                 }
             } else {
                 had_signal=false;
                 pulse_phase_q16=0;
-                on=(t%WTF_SCANNING_INTERVAL_MS)<u;
+                buzzer_phase_q16=0;
             }
         }
+#if HAS_SEPARATE_RECEPTION_LED
+        // Onboard status LED keeps an independent idle heartbeat even during
+        // reception. Boot/profile/fault diagnostics temporarily override it.
+        if (!status_special) on=(t%WTF_SCANNING_INTERVAL_MS)<u;
+#else
+        // Preserve legacy single-LED behavior on other ESP32 targets.
+        if (!status_special) {
+            if (had_signal || t<alert_until_ms) on=reception_on;
+            else on=(t%WTF_SCANNING_INTERVAL_MS)<u;
+        }
+#endif
 #if HAS_LED
         if((int)on!=prev_led) { gpio_set_level(USER_LED_GPIO,on?LED_ON:LED_OFF);prev_led=on; }
 #endif
+#if HAS_SEPARATE_RECEPTION_LED
+        if((int)reception_on!=prev_reception_led) {
+            gpio_set_level(USER_RECEPTION_LED_GPIO,
+                reception_on ? RECEPTION_LED_ON : RECEPTION_LED_OFF);
+            prev_reception_led=reception_on;
+        }
+#endif
 #if WTF_ENABLE_BUZZER
-        if((int)beep!=prev_buzzer) {gpio_set_level(USER_BUZZER_GPIO,beep?BUZZER_ON:BUZZER_OFF);prev_buzzer=beep;}
+        if((int)beep!=prev_buzzer) { wtf_buzzer_pwm_set(beep); prev_buzzer=beep; }
 #else
         (void)beep;(void)prev_buzzer;
 #endif
@@ -1313,10 +1419,21 @@ void app_main(void) {
     if (led_err == ESP_OK) led_err = gpio_set_direction(USER_LED_GPIO,GPIO_MODE_OUTPUT);
     if (led_err != ESP_OK) wtf_report_fault(WTF_F_GPIO,WTF_FATAL,led_err);
 #endif
+#if HAS_SEPARATE_RECEPTION_LED
+    esp_err_t reception_err = gpio_reset_pin(USER_RECEPTION_LED_GPIO);
+    if (reception_err == ESP_OK)
+        reception_err = gpio_set_level(USER_RECEPTION_LED_GPIO, RECEPTION_LED_OFF);
+    if (reception_err == ESP_OK)
+        reception_err = gpio_set_direction(USER_RECEPTION_LED_GPIO,GPIO_MODE_OUTPUT);
+    if (reception_err != ESP_OK)
+        wtf_report_fault(WTF_F_GPIO,WTF_FATAL,reception_err);
+#endif
 #if WTF_ENABLE_BUZZER
-    gpio_reset_pin(USER_BUZZER_GPIO);
-    gpio_set_level(USER_BUZZER_GPIO,BUZZER_OFF);
-    gpio_set_direction(USER_BUZZER_GPIO,GPIO_MODE_OUTPUT);
+    esp_err_t buzzer_err = wtf_buzzer_pwm_init();
+    if (buzzer_err != ESP_OK) {
+        ESP_LOGE(TAG, "Buzzer PWM initialization failed: %s; continuing without sound",
+                 esp_err_to_name(buzzer_err));
+    }
 #endif
     diagnostic_mode = wtf_diagnostic_jumper_present();
     int64_t t = now_ms();
@@ -1361,6 +1478,6 @@ void app_main(void) {
         if (xTaskCreate(wtf_diagnostic_task,"diagnostic",4096,NULL,3,NULL) != pdPASS)
             wtf_report_fault(WTF_F_TASK,WTF_FATAL,5);
     }
-    ESP_LOGI(TAG,"v0.1.4.1 lab ready; boot_mode=%s LED_GPIO=%d speed=%d",
+    ESP_LOGI(TAG,"v0.1.4.1 lab ready; boot_mode=%s status_LED_GPIO=%d speed=%d",
              diagnostic_mode?"diagnostic":"normal",USER_LED_GPIO,WTF_ANIMATION_SPEED);
 }
